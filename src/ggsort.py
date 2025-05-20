@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 
 import os
-import json
+import sqlite3
 import cv2
-import glob
 import argparse
 
 # Configuration
-JSON_FILE = 'results_filtered_waynes.json'  # Default JSON file
+DEFAULT_DB_FILE = 'wildlife.db'  # Default SQLite database file
 CONFIDENCE_THRESHOLD = 0.0  # Only display detections with confidence above this threshold
 
 # Color mapping for different categories (in BGR format)
 COLORS = {
-    '1': (0, 255, 0),    # Green for animals
+    '1': (0, 0, 255),    # Red for animals
     '2': (255, 0, 0),    # Blue for persons
-    '3': (0, 0, 255)     # Red for vehicles
+    '3': (0, 255, 0)     # Green for vehicles
 }
+
+# Grey color for deleted detections
+DELETED_COLOR = (128, 128, 128)  # Grey
 
 # Variables to track mouse position and bounding boxes
 mouse_x, mouse_y = 0, 0
@@ -25,6 +27,7 @@ current_metadata = None
 current_categories = None
 current_confidence_threshold = 0.0
 need_redraw = False
+selected_detection_id = None
 
 def parse_args():
     """Parse command line arguments"""
@@ -33,33 +36,70 @@ def parse_args():
                         help='Directory containing wildlife images (default: images)')
     parser.add_argument('--confidence', type=float, default=CONFIDENCE_THRESHOLD,
                         help='Confidence threshold for displaying detections (default: 0.0)')
-    parser.add_argument('--json-file', default=JSON_FILE,
-                        help=f'JSON metadata file (default: {JSON_FILE})')
+    parser.add_argument('--db-file', default=DEFAULT_DB_FILE,
+                        help=f'SQLite database file (default: {DEFAULT_DB_FILE})')
     return parser.parse_args()
 
-def load_metadata(json_file):
-    """Load the JSON metadata file"""
-    print(f"Loading metadata from {json_file}...")
-    with open(json_file, 'r') as f:
-        return json.load(f)
+def connect_to_database(db_file):
+    """Connect to the SQLite database"""
+    if not os.path.exists(db_file):
+        raise FileNotFoundError(f"Database file not found: {db_file}")
+    
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row  # Use row factory for named columns
+    return conn
 
-def find_all_images(images_dir):
-    """Find all JPG images in the images directory recursively"""
-    image_pattern = os.path.join(images_dir, "**", "*.JPG")
-    return glob.glob(image_pattern, recursive=True)
+def get_detection_categories(conn):
+    """Get detection categories from database if available, or use defaults"""
+    # In the current database, we don't store categories, so we'll use the defaults
+    # This can be expanded if categories are added to the database later
+    return {
+        '1': 'animal',
+        '2': 'person',
+        '3': 'vehicle'
+    }
 
-def create_image_to_metadata_map(metadata):
-    """Create a dictionary mapping image paths to their metadata"""
-    image_metadata = {}
-    for img_data in metadata.get('images', []):
-        file_path = img_data['file']
-        # Store using the original path from JSON
-        image_metadata[file_path] = img_data
-    return image_metadata
+def get_images_from_database(conn):
+    """Get all images from the database"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, file_path, width, height FROM images ORDER BY file_path")
+    return cursor.fetchall()
+
+def get_detections_for_image(conn, image_id, confidence_threshold):
+    """Get detections for a specific image from the database"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, category, confidence, x, y, width, height, deleted, subcategory 
+        FROM detections 
+        WHERE image_id = ? AND confidence >= ?
+        ORDER BY confidence DESC
+    """, (image_id, confidence_threshold))
+    return cursor.fetchall()
+
+def toggle_detection_deleted_status(conn, detection_id):
+    """Toggle the deleted status of a detection in the database"""
+    cursor = conn.cursor()
+    
+    # First, get the current deleted status
+    cursor.execute("SELECT deleted FROM detections WHERE id = ?", (detection_id,))
+    result = cursor.fetchone()
+    
+    if result is None:
+        return False  # Detection ID not found
+    
+    # Toggle the deleted status (0->1, 1->0)
+    current_status = result['deleted']
+    new_status = 1 if current_status == 0 else 0
+    
+    # Update the detection with the new status
+    cursor.execute("UPDATE detections SET deleted = ? WHERE id = ?", (new_status, detection_id))
+    conn.commit()
+    
+    return cursor.rowcount > 0
 
 def mouse_callback(event, x, y, flags, param):
     """Mouse callback function to track mouse position"""
-    global mouse_x, mouse_y, need_redraw
+    global mouse_x, mouse_y, need_redraw, selected_detection_id
     
     # Only respond to mouse movement
     if event == cv2.EVENT_MOUSEMOVE:
@@ -67,37 +107,37 @@ def mouse_callback(event, x, y, flags, param):
         mouse_x, mouse_y = x, y
         need_redraw = True  # Flag to indicate we need to redraw the image
 
-def draw_image_with_boxes():
+def draw_image_with_boxes(img_path, detections, categories, confidence_threshold):
     """Draw the image with bounding boxes based on current state"""
-    global current_image, current_metadata, current_categories, current_confidence_threshold, current_boxes, need_redraw
+    global current_boxes, need_redraw, selected_detection_id
     
-    if current_image is None or current_metadata is None:
+    # Read the image
+    img = cv2.imread(img_path)
+    if img is None:
+        print(f"Could not read image: {img_path}")
         return None
     
     # Create a copy of the original image to draw on
-    img_copy = current_image.copy()
+    img_copy = img.copy()
     
     height, width = img_copy.shape[:2]
     
     # Clear the current boxes list
     current_boxes = []
-    
-    # Get valid detections
-    valid_detections = [d for d in current_metadata.get('detections', []) 
-                      if d.get('conf', 0) >= current_confidence_threshold]
+    selected_detection_id = None
     
     # Draw bounding boxes
-    for detection in valid_detections:
-        confidence = detection.get('conf', 0)
-        category = detection.get('category', '1')
-        bbox = detection.get('bbox', [0, 0, 0, 0])
+    for detection in detections:
+        category = str(detection['category'])
+        confidence = detection['confidence']
+        is_deleted = detection['deleted'] == 1
+        detection_id = detection['id']
         
-        # Convert from [x, y, w, h] normalized to pixel coordinates
-        x, y, w, h = bbox
-        x_min = int(x * width)
-        y_min = int(y * height)
-        box_width = int(w * width)
-        box_height = int(h * height)
+        # Convert from normalized coordinates to pixel coordinates
+        x_min = int(detection['x'] * width)
+        y_min = int(detection['y'] * height)
+        box_width = int(detection['width'] * width)
+        box_height = int(detection['height'] * height)
         
         # Store box coordinates for mouse interaction
         box_info = {
@@ -106,13 +146,19 @@ def draw_image_with_boxes():
             'x_max': x_min + box_width,
             'y_max': y_min + box_height,
             'category': category,
-            'confidence': confidence
+            'confidence': confidence,
+            'detection_id': detection_id,
+            'is_deleted': is_deleted
         }
         current_boxes.append(box_info)
         
         # Check if mouse pointer is inside this box
         is_mouse_inside = (x_min <= mouse_x <= x_min + box_width and 
-                           y_min <= mouse_y <= y_min + box_height)
+                          y_min <= mouse_y <= y_min + box_height)
+        
+        if is_mouse_inside:
+            # Set the selected detection ID if mouse is inside
+            selected_detection_id = detection_id
         
         # Draw the rectangle
         if is_mouse_inside:
@@ -123,48 +169,43 @@ def draw_image_with_boxes():
             cv2.rectangle(img_copy, (x_min-0, y_min-0), (x_min + box_width+0, y_min + box_height+0), (0, 0, 0), 10)
         
         # Then draw the colored rectangle on top
-        color = COLORS.get(category, (255, 255, 255))
+        if is_deleted:
+            color = DELETED_COLOR  # Grey for deleted detections
+        else:
+            color = COLORS.get(category, (255, 255, 255))
         cv2.rectangle(img_copy, (x_min, y_min), (x_min + box_width, y_min + box_height), color, 4)
         
         # Add label with category and confidence
-        category_name = current_categories.get(category, 'unknown')
+        category_name = categories.get(category, 'unknown')
         label = f"{category_name}: {confidence:.2f}"
+        if is_deleted:
+            label += " (DELETED)"
+        
         # Draw black background for text to improve visibility
         (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         cv2.rectangle(img_copy, (x_min, y_min - text_height - 10), (x_min + text_width, y_min), (0, 0, 0), -1)
         # Draw the text in the color of the category
         cv2.putText(img_copy, label, (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     
-    return img_copy
+    return img, img_copy
 
-def display_image_with_boxes(image_path, metadata_entry, categories, confidence_threshold, current_index, total_images):
+def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, categories, current_index, total_images):
     """Display an image with its bounding boxes"""
-    global current_image, current_metadata, current_categories, current_confidence_threshold, need_redraw
+    global need_redraw, selected_detection_id
     
-    # Check if we have metadata for this image
-    if not metadata_entry:
-        print(f"No metadata found for {image_path}")
-        return 1  # Continue to next image
+    # Get detections for this image
+    detections = get_detections_for_image(conn, image_id, confidence_threshold)
     
-    # Check if there are any detections above the confidence threshold
-    valid_detections = [d for d in metadata_entry.get('detections', []) 
-                         if d.get('conf', 0) >= confidence_threshold]
-    
-    if not valid_detections:
+    if not detections:
         print(f"Skipping {image_path} - no detections above confidence threshold {confidence_threshold}")
         return 1  # Continue to next image
     
-    # Read the image
-    img = cv2.imread(image_path)
-    if img is None:
-        print(f"Could not read image: {image_path}")
+    # Draw the image with boxes
+    result = draw_image_with_boxes(image_path, detections, categories, confidence_threshold)
+    if result is None:
         return 1  # Continue to next image
     
-    # Update the global variables for mouse interaction
-    current_image = img
-    current_metadata = metadata_entry
-    current_categories = categories
-    current_confidence_threshold = confidence_threshold
+    original_img, display_img = result
     
     # Create the window
     window_name = "Wildlife Detector"
@@ -172,9 +213,6 @@ def display_image_with_boxes(image_path, metadata_entry, categories, confidence_
     
     # Set up the mouse callback
     cv2.setMouseCallback(window_name, mouse_callback)
-    
-    # Draw the initial image with boxes
-    display_img = draw_image_with_boxes()
     
     # Display the filename with index information
     basename = os.path.basename(image_path)
@@ -184,19 +222,22 @@ def display_image_with_boxes(image_path, metadata_entry, categories, confidence_
     # Display the image
     cv2.imshow(window_name, display_img)
     
-    print(f"Showing {image_path} with {len(valid_detections)} detection(s)")
-    print(f"Controls: SPACE = next image, BACKSPACE = previous image, ESC = exit")
+    print(f"Showing {image_path} with {len(detections)} detection(s)")
+    print(f"Controls: SPACE = next image, LEFT ARROW = previous image, BACKSPACE = toggle detection deleted status, ESC = exit")
     
     # Main event loop
     while True:
         # Check if we need to redraw due to mouse movement
         if need_redraw:
+            # Refresh detections from the database in case they've been modified
+            detections = get_detections_for_image(conn, image_id, confidence_threshold)
+            
             # Redraw the image with boxes
-            display_img = draw_image_with_boxes()
+            _, updated_img = draw_image_with_boxes(image_path, detections, categories, confidence_threshold)
             # Re-add the filename text
-            cv2.putText(display_img, display_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.putText(updated_img, display_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             # Show the updated image
-            cv2.imshow(window_name, display_img)
+            cv2.imshow(window_name, updated_img)
             need_redraw = False
         
         # Wait for key press with a short timeout to allow mouse movement updates
@@ -211,54 +252,63 @@ def display_image_with_boxes(image_path, metadata_entry, categories, confidence_
             return 0  # Exit the viewer
         elif key == 32:  # SPACE key
             return 1  # Continue to next image
-        elif key == 8 or key == 127:  # BACKSPACE key
+        elif key == 2:  # LEFT ARROW key
             return -1  # Go to previous image
+        elif key == 8 or key == 127:  # BACKSPACE key
+            # Toggle the deleted status of the currently selected detection
+            if selected_detection_id is not None:
+                success = toggle_detection_deleted_status(conn, selected_detection_id)
+                if success:
+                    print(f"Toggled deleted status for detection {selected_detection_id}")
+                    need_redraw = True
+                else:
+                    print(f"Failed to toggle deleted status for detection {selected_detection_id}")
+            else:
+                print("No detection selected. Hover over a detection to select it.")
 
 def main():
     # Parse command line arguments
     args = parse_args()
-    images_dir = args.image_dir
+    image_dir = args.image_dir
     confidence_threshold = args.confidence
-    json_file = args.json_file
+    db_file = args.db_file
     
+    print(f"Using database: {db_file}")
     print(f"Using confidence threshold: {confidence_threshold}")
     
-    # Load the JSON metadata
-    metadata = load_metadata(json_file)
-    categories = metadata.get('detection_categories', {})
-    print(f"Categories in metadata: {categories}")
-    
-    # Create a lookup table for faster image-to-metadata mapping
-    image_to_metadata = create_image_to_metadata_map(metadata)
-    print(f"Loaded metadata for {len(image_to_metadata)} images")
-    
-    # Find all images
-    all_images = find_all_images(images_dir)
-    total_images = len(all_images)
-    print(f"Found {total_images} images in {images_dir} directory")
-    
-    # Display images one by one
-    i = 0
-    while 0 <= i < total_images:
-        image_path = all_images[i]
+    try:
+        # Connect to the database
+        conn = connect_to_database(db_file)
         
-        # Get the path relative to the image directory
-        # First convert to absolute path to handle cases where images_dir is relative
-        abs_image_path = os.path.abspath(image_path)
-        abs_images_dir = os.path.abspath(images_dir)
+        # Get detection categories
+        categories = get_detection_categories(conn)
+        print(f"Categories: {categories}")
         
-        # Extract the part of the path that's relative to the image directory
-        if abs_image_path.startswith(abs_images_dir):
-            rel_path = abs_image_path[len(abs_images_dir):].lstrip(os.path.sep)
-            # Convert to the format used in the JSON (forward slashes)
-            normalized_path = rel_path.replace(os.path.sep, '/')
+        # Get all images from the database
+        images = get_images_from_database(conn)
+        total_images = len(images)
+        print(f"Found {total_images} images in the database")
+        
+        if total_images == 0:
+            print("No images found in the database")
+            return
+        
+        # Display images one by one
+        i = 0
+        while 0 <= i < total_images:
+            image = images[i]
+            image_id = image['id']
+            file_path = image['file_path']
             
-            # Find metadata for this image
-            metadata_entry = image_to_metadata.get(normalized_path)
+            # Construct the full image path
+            # If file_path is relative, join with image_dir
+            full_path = file_path
+            if not os.path.isabs(file_path):
+                full_path = os.path.join(image_dir, file_path)
             
             # Display the image with boxes
-            result = display_image_with_boxes(image_path, metadata_entry, categories, 
-                                             confidence_threshold, i, total_images)
+            result = display_image_with_boxes(conn, image_id, full_path, confidence_threshold, 
+                                             categories, i, total_images)
             
             if result == 0:
                 print("Exiting viewer...")
@@ -269,12 +319,16 @@ def main():
             elif result == -1:
                 # Move to previous image
                 i = max(0, i - 1)
-        else:
-            print(f"Warning: Image {image_path} is not within the specified image directory {images_dir}")
-            i += 1
-    
-    cv2.destroyAllWindows()
-    print("Done!")
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+    finally:
+        # Close the database connection
+        if 'conn' in locals():
+            conn.close()
+        
+        cv2.destroyAllWindows()
+        print("Done!")
 
 if __name__ == "__main__":
     main() 
