@@ -4,6 +4,7 @@ import os
 import sqlite3
 import cv2
 import argparse
+import sys
 
 # Configuration
 DEFAULT_DB_FILE = 'wildlife.db'  # Default SQLite database file
@@ -11,9 +12,11 @@ CONFIDENCE_THRESHOLD = 0.0  # Only display detections with confidence above this
 
 # Color mapping for different categories (in BGR format)
 COLORS = {
-    '1': (0, 0, 255),    # Red for animals
+    '1': (0, 0, 255),    # Red for GangGangs
     '2': (255, 0, 0),    # Blue for persons
-    '3': (0, 255, 0)     # Green for vehicles
+    '3': (0, 255, 0),     # Green for vehicles
+    '4': (0, 255, 255),   # Yellow for possums
+    '5': (255, 255, 0)    # Purple for other
 }
 
 # Grey color for deleted detections
@@ -38,6 +41,7 @@ def parse_args():
                         help='Confidence threshold for displaying detections (default: 0.0)')
     parser.add_argument('--db-file', default=DEFAULT_DB_FILE,
                         help=f'SQLite database file (default: {DEFAULT_DB_FILE})')
+    parser.add_argument('--start-index', type=int, help='Start from specific image index (overrides saved position)')
     return parser.parse_args()
 
 def connect_to_database(db_file):
@@ -49,14 +53,50 @@ def connect_to_database(db_file):
     conn.row_factory = sqlite3.Row  # Use row factory for named columns
     return conn
 
+def ensure_app_state_table(conn):
+    """Ensure app_state table exists in the database"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS app_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+
+def save_last_image_index(conn, index):
+    """Save the last viewed image index to the database"""
+    ensure_app_state_table(conn)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO app_state (key, value) VALUES ('last_image_index', ?)
+    """, (str(index),))
+    conn.commit()
+
+def get_last_image_index(conn, default=0):
+    """Get the last viewed image index from the database"""
+    ensure_app_state_table(conn)
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM app_state WHERE key = 'last_image_index'")
+    result = cursor.fetchone()
+    
+    if result:
+        try:
+            return int(result['value'])
+        except (ValueError, TypeError):
+            return default
+    return default
+
 def get_detection_categories(conn):
     """Get detection categories from database if available, or use defaults"""
     # In the current database, we don't store categories, so we'll use the defaults
     # This can be expanded if categories are added to the database later
     return {
-        '1': 'animal',
-        '2': 'person',
-        '3': 'vehicle'
+        '1': 'GangGang',
+        '2': 'Person',
+        '3': 'Vehicle',
+        '4': 'Possum',
+        '5': 'Other'
     }
 
 def get_images_from_database(conn):
@@ -95,6 +135,13 @@ def toggle_detection_deleted_status(conn, detection_id):
     cursor.execute("UPDATE detections SET deleted = ? WHERE id = ?", (new_status, detection_id))
     conn.commit()
     
+    return cursor.rowcount > 0
+
+def update_detection_category(conn, detection_id, category_id):
+    """Update the category of a detection in the database"""
+    cursor = conn.cursor()
+    cursor.execute("UPDATE detections SET category = ? WHERE id = ?", (category_id, detection_id))
+    conn.commit()
     return cursor.rowcount > 0
 
 def mouse_callback(event, x, y, flags, param):
@@ -182,10 +229,10 @@ def draw_image_with_boxes(img_path, detections, categories, confidence_threshold
             label += " (DELETED)"
         
         # Draw black background for text to improve visibility
-        (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-        cv2.rectangle(img_copy, (x_min, y_min - text_height - 10), (x_min + text_width, y_min), (0, 0, 0), -1)
+        (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cv2.rectangle(img_copy, (x_min - 2, y_min - text_height - 19), (x_min + text_width + 2, y_min - 6), (0, 0, 0), -1)
         # Draw the text in the color of the category
-        cv2.putText(img_copy, label, (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        cv2.putText(img_copy, label, (x_min, y_min - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     
     return img, img_copy
 
@@ -217,14 +264,19 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
     # Display the filename with index information
     basename = os.path.basename(image_path)
     display_text = f"{current_index+1} / {total_images} : {basename}"
-    cv2.putText(display_img, display_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    # cv2.putText(display_img, display_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    # cv2.putText(display_img, display_text, (100, display_img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
     
     # Display the image
-    cv2.imshow(window_name, display_img)
+    # cv2.imshow(window_name, display_img)
     
     print(f"Showing {image_path} with {len(detections)} detection(s)")
-    print(f"Controls: SPACE = next image, LEFT ARROW = previous image, BACKSPACE = toggle detection deleted status, ESC = exit")
+    print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, p = mark as possum, o = mark as other, ESC = exit")
     
+    # Save current position to database
+    save_last_image_index(conn, current_index)
+    
+    need_redraw = True
     # Main event loop
     while True:
         # Check if we need to redraw due to mouse movement
@@ -234,8 +286,12 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
             
             # Redraw the image with boxes
             _, updated_img = draw_image_with_boxes(image_path, detections, categories, confidence_threshold)
-            # Re-add the filename text
-            cv2.putText(updated_img, display_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            # Re-add the filename text at the bottom of the image
+            text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
+            text_height = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[1]
+            text_x = int(updated_img.shape[1] / 2 - text_size[0] / 2)
+            text_y = int(updated_img.shape[0] - text_height - 0)  # 10px padding from bottom
+            cv2.putText(updated_img, display_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
             # Show the updated image
             cv2.imshow(window_name, updated_img)
             need_redraw = False
@@ -249,12 +305,18 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
             
         print(f"Key pressed: {key}")
         if key == 27 or key == 113:  # ESC key or q
+            # Save the current index before exiting
+            save_last_image_index(conn, current_index)
             return 0  # Exit the viewer
-        elif key == 32:  # SPACE key
+        elif key == 32 or key == 3:  # SPACE or right arrow
+            # Save position before moving
+            save_last_image_index(conn, current_index + 1)
             return 1  # Continue to next image
         elif key == 2:  # LEFT ARROW key
+            # Save position before moving
+            save_last_image_index(conn, max(0, current_index - 1))
             return -1  # Go to previous image
-        elif key == 8 or key == 127:  # BACKSPACE key
+        elif key == 8 or key == 127 or key == 120:  # BACKSPACE or 'x' key
             # Toggle the deleted status of the currently selected detection
             if selected_detection_id is not None:
                 success = toggle_detection_deleted_status(conn, selected_detection_id)
@@ -265,6 +327,28 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
                     print(f"Failed to toggle deleted status for detection {selected_detection_id}")
             else:
                 print("No detection selected. Hover over a detection to select it.")
+        elif key == 112:  # 'p' key
+            # Set category to possum (category ID 4)
+            if selected_detection_id is not None:
+                success = update_detection_category(conn, selected_detection_id, 4)
+                if success:
+                    print(f"Changed detection {selected_detection_id} category to Possum")
+                    need_redraw = True
+                else:
+                    print(f"Failed to change detection {selected_detection_id} category")
+            else:
+                print("No detection selected. Hover over a detection to select it.")
+        elif key == 111:  # 'o' key
+            # Set category to other (category ID 5)
+            if selected_detection_id is not None:
+                success = update_detection_category(conn, selected_detection_id, 5)
+                if success:
+                    print(f"Changed detection {selected_detection_id} category to Other")
+                    need_redraw = True
+                else:
+                    print(f"Failed to change detection {selected_detection_id} category")
+            else:
+                print("No detection selected. Hover over a detection to select it.")
 
 def main():
     # Parse command line arguments
@@ -272,6 +356,7 @@ def main():
     image_dir = args.image_dir
     confidence_threshold = args.confidence
     db_file = args.db_file
+    start_index = args.start_index
     
     print(f"Using database: {db_file}")
     print(f"Using confidence threshold: {confidence_threshold}")
@@ -293,8 +378,20 @@ def main():
             print("No images found in the database")
             return
         
-        # Display images one by one
+        # Determine starting index
         i = 0
+        if start_index is not None:
+            # Use the specified index from command line if provided
+            i = max(0, min(start_index, total_images - 1))
+            print(f"Starting from specified index: {i}")
+        else:
+            # Otherwise use the last saved position
+            i = get_last_image_index(conn)
+            # Ensure the index is valid
+            i = max(0, min(i, total_images - 1))
+            print(f"Resuming from last position: {i}")
+        
+        # Display images one by one
         while 0 <= i < total_images:
             image = images[i]
             image_id = image['id']
@@ -322,6 +419,8 @@ def main():
         
     except Exception as e:
         print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
     finally:
         # Close the database connection
         if 'conn' in locals():
