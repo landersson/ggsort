@@ -19,6 +19,13 @@ COLORS = {
     '5': (255, 255, 0)    # Purple for other
 }
 
+# Category key mappings
+CATEGORY_KEYS = {
+    112: {'id': 4, 'name': 'Possum'},  # 'p' key
+    111: {'id': 5, 'name': 'Other'},   # 'o' key
+    103: {'id': 1, 'name': 'GangGang'} # 'g' key
+}
+
 # Grey color for deleted detections
 DELETED_COLOR = (128, 128, 128)  # Grey
 
@@ -144,6 +151,20 @@ def update_detection_category(conn, detection_id, category_id):
     conn.commit()
     return cursor.rowcount > 0
 
+def handle_category_change(conn, detection_id, category_info):
+    """Handle changing a detection's category"""
+    if detection_id is None:
+        print("No detection selected. Hover over a detection to select it.")
+        return False
+    
+    success = update_detection_category(conn, detection_id, category_info['id'])
+    if success:
+        print(f"Changed detection {detection_id} category to {category_info['name']}")
+        return True
+    else:
+        print(f"Failed to change detection {detection_id} category")
+        return False
+
 def mouse_callback(event, x, y, flags, param):
     """Mouse callback function to track mouse position"""
     global mouse_x, mouse_y, need_redraw, selected_detection_id
@@ -154,18 +175,12 @@ def mouse_callback(event, x, y, flags, param):
         mouse_x, mouse_y = x, y
         need_redraw = True  # Flag to indicate we need to redraw the image
 
-def draw_image_with_boxes(img_path, detections, categories, confidence_threshold):
-    """Draw the image with bounding boxes based on current state"""
-    global current_boxes, need_redraw, selected_detection_id
-    
-    # Read the image
-    img = cv2.imread(img_path)
-    if img is None:
-        print(f"Could not read image: {img_path}")
-        return None
+def draw_boxes_on_image(original_img, detections, categories):
+    """Draw bounding boxes on a copy of the original image"""
+    global current_boxes, selected_detection_id
     
     # Create a copy of the original image to draw on
-    img_copy = img.copy()
+    img_copy = original_img.copy()
     
     height, width = img_copy.shape[:2]
     
@@ -234,7 +249,7 @@ def draw_image_with_boxes(img_path, detections, categories, confidence_threshold
         # Draw the text in the color of the category
         cv2.putText(img_copy, label, (x_min, y_min - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     
-    return img, img_copy
+    return img_copy
 
 def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, categories, current_index, total_images):
     """Display an image with its bounding boxes"""
@@ -247,15 +262,17 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
         print(f"Skipping {image_path} - no detections above confidence threshold {confidence_threshold}")
         return 1  # Continue to next image
     
-    # Draw the image with boxes
-    result = draw_image_with_boxes(image_path, detections, categories, confidence_threshold)
-    if result is None:
+    # Load the image from disk - only do this once
+    original_img = cv2.imread(image_path)
+    if original_img is None:
+        print(f"Could not read image: {image_path}")
         return 1  # Continue to next image
     
-    original_img, display_img = result
+    # Draw the initial boxes
+    display_img = draw_boxes_on_image(original_img, detections, categories)
     
     # Create the window
-    window_name = "Wildlife Detector"
+    window_name = "GGSort"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     
     # Set up the mouse callback
@@ -264,11 +281,6 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
     # Display the filename with index information
     basename = os.path.basename(image_path)
     display_text = f"{current_index+1} / {total_images} : {basename}"
-    # cv2.putText(display_img, display_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    # cv2.putText(display_img, display_text, (100, display_img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    
-    # Display the image
-    # cv2.imshow(window_name, display_img)
     
     print(f"Showing {image_path} with {len(detections)} detection(s)")
     print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, p = mark as possum, o = mark as other, ESC = exit")
@@ -284,14 +296,16 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
             # Refresh detections from the database in case they've been modified
             detections = get_detections_for_image(conn, image_id, confidence_threshold)
             
-            # Redraw the image with boxes
-            _, updated_img = draw_image_with_boxes(image_path, detections, categories, confidence_threshold)
-            # Re-add the filename text at the bottom of the image
+            # Redraw using the cached original image
+            updated_img = draw_boxes_on_image(original_img, detections, categories)
+            
+            # Add the filename text at the bottom of the image
             text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
             text_height = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[1]
             text_x = int(updated_img.shape[1] / 2 - text_size[0] / 2)
             text_y = int(updated_img.shape[0] - text_height - 0)  # 10px padding from bottom
             cv2.putText(updated_img, display_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            
             # Show the updated image
             cv2.imshow(window_name, updated_img)
             need_redraw = False
@@ -327,28 +341,9 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
                     print(f"Failed to toggle deleted status for detection {selected_detection_id}")
             else:
                 print("No detection selected. Hover over a detection to select it.")
-        elif key == 112:  # 'p' key
-            # Set category to possum (category ID 4)
-            if selected_detection_id is not None:
-                success = update_detection_category(conn, selected_detection_id, 4)
-                if success:
-                    print(f"Changed detection {selected_detection_id} category to Possum")
-                    need_redraw = True
-                else:
-                    print(f"Failed to change detection {selected_detection_id} category")
-            else:
-                print("No detection selected. Hover over a detection to select it.")
-        elif key == 111:  # 'o' key
-            # Set category to other (category ID 5)
-            if selected_detection_id is not None:
-                success = update_detection_category(conn, selected_detection_id, 5)
-                if success:
-                    print(f"Changed detection {selected_detection_id} category to Other")
-                    need_redraw = True
-                else:
-                    print(f"Failed to change detection {selected_detection_id} category")
-            else:
-                print("No detection selected. Hover over a detection to select it.")
+        elif key in CATEGORY_KEYS:  # Category change keys (p, o, etc.)
+            if handle_category_change(conn, selected_detection_id, CATEGORY_KEYS[key]):
+                need_redraw = True
 
 def main():
     # Parse command line arguments
