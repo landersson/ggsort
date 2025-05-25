@@ -1,0 +1,53 @@
+#!/bin/bash
+# Get the directory containing this script
+BASE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && cd .. && pwd )"
+
+# Default image directory
+IMAGE_DIR=/Volumes/StaceyGG1/
+JSON_FILE=$BASE_DIR/data/results.json
+
+if [ $# -eq 0 ]; then
+    echo "Error: Please provide a location as the first argument"
+    echo "Usage: $0 <LOCATION> [IMAGE_DIR]"
+    exit 1
+fi
+LOCATION=$1
+if [ $# -eq 2 ]; then
+    IMAGE_DIR=$2
+fi
+
+# Check if the image directory exists
+if [ ! -d "$IMAGE_DIR" ]; then
+    echo "Error: Image directory '$IMAGE_DIR' does not exist"
+    exit 1
+fi
+
+echo "Sorting $LOCATION in $IMAGE_DIR"
+
+if [ ! -f $JSON_FILE ]; then
+    echo "Unzipping $JSON_FILE.gz"
+    if ! gunzip -c $JSON_FILE.gz > $JSON_FILE; then
+        echo "Error: Failed to unzip $JSON_FILE.gz"
+        exit 1
+    fi
+fi
+
+DB_FILE=$BASE_DIR/dbs/${LOCATION}.db
+
+if [ ! -f $DB_FILE ]; then
+    echo "Creating new database file $DB_FILE"
+    if ! python $BASE_DIR/src/make_db.py \
+        --base-dir $LOCATION \
+        --image-dir $IMAGE_DIR \
+        --conf-threshold 0.05 \
+        --output $DB_FILE; then
+        echo "Error: Failed to create database file"
+        exit 1
+    fi
+else
+    echo "Using existing database file $DB_FILE"
+fi
+
+python $BASE_DIR/src/ggsort.py \
+    --db-file $DB_FILE \
+    --image-dir $IMAGE_DIR

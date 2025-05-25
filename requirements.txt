@@ -1,1 +1,4 @@
+pillow
 opencv-python
+exifread
+tqdm

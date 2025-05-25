@@ -39,6 +39,13 @@ current_confidence_threshold = 0.0
 need_redraw = False
 selected_detection_id = None
 
+# Variables for relocation mode
+relocation_mode = False
+relocation_detection_id = None
+relocation_clicks = []
+relocation_conn = None
+relocation_original_img = None
+
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='View wildlife images with detection boxes')
@@ -151,6 +158,17 @@ def update_detection_category(conn, detection_id, category_id):
     conn.commit()
     return cursor.rowcount > 0
 
+def update_detection_coordinates(conn, detection_id, x, y, width, height):
+    """Update the coordinates of a detection in the database"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE detections 
+        SET x = ?, y = ?, width = ?, height = ?
+        WHERE id = ?
+    """, (x, y, width, height, detection_id))
+    conn.commit()
+    return cursor.rowcount > 0
+
 def handle_category_change(conn, detection_id, category_info):
     """Handle changing a detection's category"""
     if detection_id is None:
@@ -165,19 +183,122 @@ def handle_category_change(conn, detection_id, category_info):
         print(f"Failed to change detection {detection_id} category")
         return False
 
-def mouse_callback(event, x, y, flags, param):
-    """Mouse callback function to track mouse position"""
-    global mouse_x, mouse_y, need_redraw, selected_detection_id
+def handle_relocation_mode(conn, image_id, original_img):
+    """Handle relocation mode toggle and processing"""
+    global relocation_mode, relocation_detection_id, relocation_clicks, selected_detection_id, need_redraw
+    global relocation_conn, relocation_original_img
     
-    # Only respond to mouse movement
+    if not relocation_mode:
+        # Entering relocation mode
+        if selected_detection_id is None:
+            print("No detection selected. Hover over a detection to select it first.")
+            return
+        
+        print(f"Entering relocation mode for detection {selected_detection_id}")
+        print("Click twice to define new bounding box: first click = top-left, second click = bottom-right")
+        print("Press 'c' again to cancel relocation")
+        
+        relocation_mode = True
+        relocation_detection_id = selected_detection_id
+        relocation_clicks = []
+        relocation_conn = conn
+        relocation_original_img = original_img
+        need_redraw = True
+        
+    else:
+        # Already in relocation mode - cancel it
+        print("Cancelled relocation mode")
+        relocation_mode = False
+        relocation_detection_id = None
+        relocation_clicks = []
+        relocation_conn = None
+        relocation_original_img = None
+        need_redraw = True
+
+def apply_relocation(conn, image_id, original_img):
+    """Apply the relocation changes to the database"""
+    global relocation_mode, relocation_detection_id, relocation_clicks, need_redraw
+    
+    if len(relocation_clicks) != 2:
+        print("Error: Need exactly 2 clicks to apply relocation")
+        return
+    
+    # Get image dimensions
+    height, width = original_img.shape[:2]
+    
+    # Calculate new bounding box from clicks
+    x1, y1 = relocation_clicks[0]
+    x2, y2 = relocation_clicks[1]
+    
+    # Calculate proper top-left and bottom-right coordinates
+    new_x_min = min(x1, x2)
+    new_y_min = min(y1, y2)
+    new_x_max = max(x1, x2)
+    new_y_max = max(y1, y2)
+    
+    # Convert to normalized coordinates (0-1 range)
+    new_x = new_x_min / width
+    new_y = new_y_min / height
+    new_width = (new_x_max - new_x_min) / width
+    new_height = (new_y_max - new_y_min) / height
+    
+    # Ensure coordinates are within valid range
+    new_x = max(0, min(1, new_x))
+    new_y = max(0, min(1, new_y))
+    new_width = max(0, min(1 - new_x, new_width))
+    new_height = max(0, min(1 - new_y, new_height))
+    
+    # Update the database
+    success = update_detection_coordinates(conn, relocation_detection_id, new_x, new_y, new_width, new_height)
+    
+    if success:
+        print(f"Successfully relocated detection {relocation_detection_id}")
+        print(f"New coordinates: x={new_x:.3f}, y={new_y:.3f}, width={new_width:.3f}, height={new_height:.3f}")
+    else:
+        print(f"Failed to relocate detection {relocation_detection_id}")
+    
+    # Exit relocation mode
+    relocation_mode = False
+    relocation_detection_id = None
+    relocation_clicks = []
+    need_redraw = True
+
+def apply_relocation_from_callback():
+    """Apply relocation from mouse callback using global variables"""
+    global relocation_conn, relocation_original_img
+    
+    if relocation_conn is None or relocation_original_img is None:
+        print("Error: Relocation context not available")
+        return
+    
+    apply_relocation(relocation_conn, None, relocation_original_img)
+
+def mouse_callback(event, x, y, flags, param):
+    """Mouse callback function to track mouse position and handle relocation clicks"""
+    global mouse_x, mouse_y, need_redraw, selected_detection_id, relocation_mode, relocation_clicks
+    
+    # Always update mouse coordinates for hover detection
     if event == cv2.EVENT_MOUSEMOVE:
         # Update the mouse coordinates
         mouse_x, mouse_y = x, y
         need_redraw = True  # Flag to indicate we need to redraw the image
+    
+    # Handle mouse clicks during relocation mode
+    elif event == cv2.EVENT_LBUTTONDOWN and relocation_mode:
+        # Add the click coordinates to the list
+        relocation_clicks.append((x, y))
+        print(f"Click {len(relocation_clicks)}: ({x}, {y})")
+        
+        if len(relocation_clicks) == 2:
+            print("Two clicks recorded. Applying new coordinates...")
+            # Automatically apply the relocation after second click
+            apply_relocation_from_callback()
+        
+        need_redraw = True
 
 def draw_boxes_on_image(original_img, detections, categories):
     """Draw bounding boxes on a copy of the original image"""
-    global current_boxes, selected_detection_id
+    global current_boxes, selected_detection_id, relocation_mode, relocation_detection_id, relocation_clicks
     
     # Create a copy of the original image to draw on
     img_copy = original_img.copy()
@@ -186,7 +307,8 @@ def draw_boxes_on_image(original_img, detections, categories):
     
     # Clear the current boxes list
     current_boxes = []
-    selected_detection_id = None
+    if not relocation_mode:
+        selected_detection_id = None
     
     # Draw bounding boxes
     for detection in detections:
@@ -214,13 +336,18 @@ def draw_boxes_on_image(original_img, detections, categories):
         }
         current_boxes.append(box_info)
         
-        # Check if mouse pointer is inside this box
-        is_mouse_inside = (x_min <= mouse_x <= x_min + box_width and 
-                          y_min <= mouse_y <= y_min + box_height)
+        # Check if mouse pointer is inside this box (only if not in relocation mode)
+        is_mouse_inside = False
+        if not relocation_mode:
+            is_mouse_inside = (x_min <= mouse_x <= x_min + box_width and 
+                              y_min <= mouse_y <= y_min + box_height)
+            
+            if is_mouse_inside:
+                # Set the selected detection ID if mouse is inside
+                selected_detection_id = detection_id
         
-        if is_mouse_inside:
-            # Set the selected detection ID if mouse is inside
-            selected_detection_id = detection_id
+        # Check if this is the detection being relocated
+        is_being_relocated = (relocation_mode and detection_id == relocation_detection_id)
         
         # Draw the rectangle
         if is_mouse_inside:
@@ -231,7 +358,9 @@ def draw_boxes_on_image(original_img, detections, categories):
             cv2.rectangle(img_copy, (x_min-0, y_min-0), (x_min + box_width+0, y_min + box_height+0), (0, 0, 0), 10)
         
         # Then draw the colored rectangle on top
-        if is_deleted:
+        if is_being_relocated:
+            color = (0, 0, 0)  # Black for detection being relocated
+        elif is_deleted:
             color = DELETED_COLOR  # Grey for deleted detections
         else:
             color = COLORS.get(category, (255, 255, 255))
@@ -249,11 +378,41 @@ def draw_boxes_on_image(original_img, detections, categories):
         # Draw the text in the color of the category
         cv2.putText(img_copy, label, (x_min, y_min - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     
+    # Draw relocation clicks if in relocation mode
+    if relocation_mode and relocation_clicks:
+        for i, (click_x, click_y) in enumerate(relocation_clicks):
+            # Draw a small circle at each click position
+            cv2.circle(img_copy, (click_x, click_y), 8, (0, 255, 255), -1)  # Yellow circle
+            # Add number label
+            cv2.putText(img_copy, str(i + 1), (click_x - 5, click_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        
+        # If we have two clicks, draw the new bounding box
+        if len(relocation_clicks) == 2:
+            x1, y1 = relocation_clicks[0]
+            x2, y2 = relocation_clicks[1]
+            # Calculate proper top-left and bottom-right coordinates
+            new_x_min = min(x1, x2)
+            new_y_min = min(y1, y2)
+            new_x_max = max(x1, x2)
+            new_y_max = max(y1, y2)
+            # Draw the new bounding box in bright green
+            cv2.rectangle(img_copy, (new_x_min, new_y_min), (new_x_max, new_y_max), (0, 255, 0), 3)
+    
     return img_copy
 
 def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, categories, current_index, total_images):
     """Display an image with its bounding boxes"""
-    global need_redraw, selected_detection_id
+    global need_redraw, selected_detection_id, relocation_mode, relocation_detection_id, relocation_clicks
+    global relocation_conn, relocation_original_img
+    
+    # Reset relocation mode when switching images
+    if relocation_mode:
+        print("Exiting relocation mode due to image change")
+        relocation_mode = False
+        relocation_detection_id = None
+        relocation_clicks = []
+        relocation_conn = None
+        relocation_original_img = None
     
     # Get detections for this image
     detections = get_detections_for_image(conn, image_id, confidence_threshold)
@@ -283,7 +442,7 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
     display_text = f"{current_index+1} / {total_images} : {basename}"
     
     print(f"Showing {image_path} with {len(detections)} detection(s)")
-    print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, p = mark as possum, o = mark as other, ESC = exit")
+    print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, p = mark as possum, o = mark as other, c = relocate detection, ESC = exit")
     
     # Save current position to database
     save_last_image_index(conn, current_index)
@@ -341,6 +500,8 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
                     print(f"Failed to toggle deleted status for detection {selected_detection_id}")
             else:
                 print("No detection selected. Hover over a detection to select it.")
+        elif key == 99:  # 'c' key for relocation mode
+            handle_relocation_mode(conn, image_id, original_img)
         elif key in CATEGORY_KEYS:  # Category change keys (p, o, etc.)
             if handle_category_change(conn, selected_detection_id, CATEGORY_KEYS[key]):
                 need_redraw = True
