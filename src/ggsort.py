@@ -46,6 +46,10 @@ relocation_clicks = []
 relocation_conn = None
 relocation_original_img = None
 
+# Variables for handling overlapping detections
+overlapping_detections = []
+current_overlap_index = 0
+
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='View wildlife images with detection boxes')
@@ -183,6 +187,21 @@ def handle_category_change(conn, detection_id, category_info):
         print(f"Failed to change detection {detection_id} category")
         return False
 
+def cycle_overlapping_detections():
+    """Cycle through overlapping detections under the mouse cursor"""
+    global overlapping_detections, current_overlap_index, selected_detection_id, need_redraw
+    
+    if len(overlapping_detections) <= 1:
+        print("No overlapping detections to cycle through")
+        return
+    
+    # Move to the next detection in the overlapping list
+    current_overlap_index = (current_overlap_index + 1) % len(overlapping_detections)
+    selected_detection_id = overlapping_detections[current_overlap_index]['detection_id']
+    
+    print(f"Cycled to detection {selected_detection_id} ({current_overlap_index + 1}/{len(overlapping_detections)})")
+    need_redraw = True
+
 def handle_relocation_mode(conn, image_id, original_img):
     """Handle relocation mode toggle and processing"""
     global relocation_mode, relocation_detection_id, relocation_clicks, selected_detection_id, need_redraw
@@ -299,6 +318,7 @@ def mouse_callback(event, x, y, flags, param):
 def draw_boxes_on_image(original_img, detections, categories):
     """Draw bounding boxes on a copy of the original image"""
     global current_boxes, selected_detection_id, relocation_mode, relocation_detection_id, relocation_clicks
+    global overlapping_detections, current_overlap_index
     
     # Create a copy of the original image to draw on
     img_copy = original_img.copy()
@@ -307,10 +327,9 @@ def draw_boxes_on_image(original_img, detections, categories):
     
     # Clear the current boxes list
     current_boxes = []
-    if not relocation_mode:
-        selected_detection_id = None
     
-    # Draw bounding boxes
+    # First pass: collect all detection boxes and find overlapping ones
+    detection_boxes = []
     for detection in detections:
         category = str(detection['category'])
         confidence = detection['confidence']
@@ -332,30 +351,65 @@ def draw_boxes_on_image(original_img, detections, categories):
             'category': category,
             'confidence': confidence,
             'detection_id': detection_id,
-            'is_deleted': is_deleted
+            'is_deleted': is_deleted,
+            'detection': detection
         }
+        detection_boxes.append(box_info)
         current_boxes.append(box_info)
-        
-        # Check if mouse pointer is inside this box (only if not in relocation mode)
-        is_mouse_inside = False
-        if not relocation_mode:
-            is_mouse_inside = (x_min <= mouse_x <= x_min + box_width and 
-                              y_min <= mouse_y <= y_min + box_height)
+    
+    # Find all detections under the mouse cursor (only if not in relocation mode)
+    if not relocation_mode:
+        # Find current overlapping detections
+        current_overlapping = []
+        for box_info in detection_boxes:
+            x_min, y_min = box_info['x_min'], box_info['y_min']
+            x_max, y_max = box_info['x_max'], box_info['y_max']
             
-            if is_mouse_inside:
-                # Set the selected detection ID if mouse is inside
-                selected_detection_id = detection_id
+            if x_min <= mouse_x <= x_max and y_min <= mouse_y <= y_max:
+                current_overlapping.append(box_info)
+        
+        # Check if the overlapping detections have changed (mouse moved to different area)
+        current_ids = [box['detection_id'] for box in current_overlapping]
+        previous_ids = [box['detection_id'] for box in overlapping_detections]
+        
+        if current_ids != previous_ids:
+            # Mouse moved to a different set of detections, reset the cycling
+            overlapping_detections = current_overlapping
+            current_overlap_index = 0
+        
+        # Set the selected detection
+        if overlapping_detections:
+            current_overlap_index = current_overlap_index % len(overlapping_detections)
+            selected_detection_id = overlapping_detections[current_overlap_index]['detection_id']
+        else:
+            current_overlap_index = 0
+            selected_detection_id = None
+    
+    # Second pass: draw all detection boxes
+    for box_info in detection_boxes:
+        detection = box_info['detection']
+        category = box_info['category']
+        confidence = box_info['confidence']
+        is_deleted = box_info['is_deleted']
+        detection_id = box_info['detection_id']
+        x_min, y_min = box_info['x_min'], box_info['y_min']
+        x_max, y_max = box_info['x_max'], box_info['y_max']
+        box_width = x_max - x_min
+        box_height = y_max - y_min
+        
+        # Check if this detection is currently selected
+        is_selected = (detection_id == selected_detection_id)
         
         # Check if this is the detection being relocated
         is_being_relocated = (relocation_mode and detection_id == relocation_detection_id)
         
-        # Draw the rectangle
-        if is_mouse_inside:
-            # Highlight with white if mouse is inside
-            cv2.rectangle(img_copy, (x_min-0, y_min-0), (x_min + box_width+0, y_min + box_height+0), (255, 255, 255), 10)
+        # Draw the rectangle outline
+        if is_selected and not relocation_mode:
+            # Highlight with white if this is the selected detection
+            cv2.rectangle(img_copy, (x_min-0, y_min-0), (x_max+0, y_max+0), (255, 255, 255), 10)
         else:
             # Normal black outline
-            cv2.rectangle(img_copy, (x_min-0, y_min-0), (x_min + box_width+0, y_min + box_height+0), (0, 0, 0), 10)
+            cv2.rectangle(img_copy, (x_min-0, y_min-0), (x_max+0, y_max+0), (0, 0, 0), 10)
         
         # Then draw the colored rectangle on top
         if is_being_relocated:
@@ -364,13 +418,17 @@ def draw_boxes_on_image(original_img, detections, categories):
             color = DELETED_COLOR  # Grey for deleted detections
         else:
             color = COLORS.get(category, (255, 255, 255))
-        cv2.rectangle(img_copy, (x_min, y_min), (x_min + box_width, y_min + box_height), color, 4)
+        cv2.rectangle(img_copy, (x_min, y_min), (x_max, y_max), color, 4)
         
         # Add label with category and confidence
         category_name = categories.get(category, 'unknown')
         label = f"{category_name}: {confidence:.2f}"
         if is_deleted:
             label += " (DELETED)"
+        
+        # If this is the selected detection and there are overlapping detections, show the index
+        if is_selected and len(overlapping_detections) > 1:
+            label += f" [{current_overlap_index + 1}/{len(overlapping_detections)}]"
         
         # Draw black background for text to improve visibility
         (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
@@ -403,7 +461,7 @@ def draw_boxes_on_image(original_img, detections, categories):
 def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, categories, current_index, total_images):
     """Display an image with its bounding boxes"""
     global need_redraw, selected_detection_id, relocation_mode, relocation_detection_id, relocation_clicks
-    global relocation_conn, relocation_original_img
+    global relocation_conn, relocation_original_img, overlapping_detections, current_overlap_index
     
     # Reset relocation mode when switching images
     if relocation_mode:
@@ -413,6 +471,10 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
         relocation_clicks = []
         relocation_conn = None
         relocation_original_img = None
+    
+    # Reset overlapping detection state when switching images
+    overlapping_detections = []
+    current_overlap_index = 0
     
     # Get detections for this image
     detections = get_detections_for_image(conn, image_id, confidence_threshold)
@@ -442,7 +504,7 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
     display_text = f"{current_index+1} / {total_images} : {basename}"
     
     print(f"Showing {image_path} with {len(detections)} detection(s)")
-    print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, p = mark as possum, o = mark as other, c = relocate detection, ESC = exit")
+    print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, p = mark as possum, o = mark as other, c = relocate detection, TAB = cycle overlapping detections, ESC = exit")
     
     # Save current position to database
     save_last_image_index(conn, current_index)
@@ -502,6 +564,8 @@ def display_image_with_boxes(conn, image_id, image_path, confidence_threshold, c
                 print("No detection selected. Hover over a detection to select it.")
         elif key == 99:  # 'c' key for relocation mode
             handle_relocation_mode(conn, image_id, original_img)
+        elif key == 9:  # TAB key for cycling through overlapping detections
+            cycle_overlapping_detections()
         elif key in CATEGORY_KEYS:  # Category change keys (p, o, etc.)
             if handle_category_change(conn, selected_detection_id, CATEGORY_KEYS[key]):
                 need_redraw = True

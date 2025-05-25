@@ -33,6 +33,8 @@ pip install -r requirements.txt
 
 When 'C' is pressed to relocate a highlighted detection, the detection will become dark grey. In this mode, move the mouse cursor to the top-left corner of the new detection rectangle and click the left button. A yellow marker will appear to indicate the selected location. Next, move the mouse to the bottom right corner of the new rectangle and click the left button a second time to finish the relocation. Press 'C' any time in this mode to cancel the relocation operation.
 
+When the mouse pointer is inside multiple detection rectangles, use the TAB key to cycle trough the list to select the active one.
+
 ## Detection Categories
 
 The system supports five categories with color-coded bounding boxes:
