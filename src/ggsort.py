@@ -7,7 +7,6 @@ import argparse
 import sys
 
 # Configuration
-DEFAULT_DB_FILE = 'wildlife.db'  # Default SQLite database file
 CONFIDENCE_THRESHOLD = 0.0  # Only display detections with confidence above this threshold
 
 # Color mapping for different categories (in BGR format)
@@ -57,8 +56,7 @@ def parse_args():
                         help='Directory containing wildlife images (default: images)')
     parser.add_argument('--confidence', type=float, default=CONFIDENCE_THRESHOLD,
                         help='Confidence threshold for displaying detections (default: 0.0)')
-    parser.add_argument('--db-file', default=DEFAULT_DB_FILE,
-                        help=f'SQLite database file (default: {DEFAULT_DB_FILE})')
+    parser.add_argument('--db-file', help='SQLite database file')
     parser.add_argument('--start-index', type=int, help='Start from specific image index (overrides saved position)')
     return parser.parse_args()
 
