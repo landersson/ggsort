@@ -461,6 +461,7 @@ class UserInterface:
         self.renderer = renderer
         self.state = state
         self.window_name = "GGSort"
+        self.current_original_img = None  # Store current image for relocation
 
     def mouse_callback(self, event, x: int, y: int, flags, param):
         """Handle mouse events"""
@@ -472,8 +473,12 @@ class UserInterface:
             
             if len(self.state.relocation_clicks) == 2:
                 print("Two clicks recorded. Applying new coordinates...")
-                # Note: We'll need to pass the original image to apply_relocation
-                # This will be handled in the main display loop
+                # Apply relocation immediately when second click is made
+                if self.current_original_img is not None:
+                    self.controller.apply_relocation(self.state, self.current_original_img)
+                else:
+                    print("Error: No image available for relocation")
+                    self.state.reset_relocation_mode()
             
             self.state.need_redraw = True
 
@@ -505,10 +510,7 @@ class UserInterface:
             if self.controller.handle_category_change(self.state.selected_detection_id, CATEGORY_KEYS[key]):
                 self.state.need_redraw = True
         
-        # Handle relocation completion
-        if (self.state.relocation_mode and len(self.state.relocation_clicks) == 2 and 
-            original_img is not None):
-            self.controller.apply_relocation(self.state, original_img)
+        # Note: Relocation completion is now handled in mouse_callback when second click is made
         
         return None
 
@@ -535,6 +537,9 @@ class UserInterface:
         if original_img is None:
             print(f"Could not read image: {image_path}")
             return 1
+        
+        # Store the original image for relocation operations
+        self.current_original_img = original_img
         
         # Setup window
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
