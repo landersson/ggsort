@@ -235,6 +235,50 @@ class TestDatabaseManager(unittest.TestCase):
         success = self.db_manager.update_detection_coordinates(999, 0.1, 0.2, 0.3, 0.4)
         self.assertFalse(success)
     
+    def test_mark_all_detections_deleted(self):
+        """Test marking all detections on an image as deleted"""
+        # Initially, detections on image 1 should not be deleted
+        detections = self.db_manager.get_detections_for_image(1, 0.0)
+        self.assertEqual(len(detections), 2)
+        for detection in detections:
+            self.assertFalse(detection.deleted)
+        
+        # Mark all detections on image 1 as deleted
+        affected_count = self.db_manager.mark_all_detections_deleted(1)
+        self.assertEqual(affected_count, 2)  # Should affect 2 detections
+        
+        # Verify all detections on image 1 are now deleted
+        detections = self.db_manager.get_detections_for_image(1, 0.0)
+        self.assertEqual(len(detections), 2)
+        for detection in detections:
+            self.assertTrue(detection.deleted)
+        
+        # Verify detections on image 2 are not affected
+        detections_image2 = self.db_manager.get_detections_for_image(2, 0.0)
+        self.assertEqual(len(detections_image2), 1)
+        self.assertTrue(detections_image2[0].deleted)  # This one was already deleted in test data
+    
+    def test_mark_all_detections_deleted_no_detections(self):
+        """Test marking all detections as deleted on image with no detections"""
+        # Try to mark detections on non-existent image
+        affected_count = self.db_manager.mark_all_detections_deleted(999)
+        self.assertEqual(affected_count, 0)  # Should affect 0 detections
+    
+    def test_mark_all_detections_deleted_already_deleted(self):
+        """Test marking all detections as deleted when they're already deleted"""
+        # First, mark all detections on image 1 as deleted
+        affected_count = self.db_manager.mark_all_detections_deleted(1)
+        self.assertEqual(affected_count, 2)
+        
+        # Mark them as deleted again - should still affect them (sets deleted=1 regardless)
+        affected_count = self.db_manager.mark_all_detections_deleted(1)
+        self.assertEqual(affected_count, 2)
+        
+        # Verify they're still deleted
+        detections = self.db_manager.get_detections_for_image(1, 0.0)
+        for detection in detections:
+            self.assertTrue(detection.deleted)
+    
     def test_app_state_table_creation(self):
         """Test that app_state table is created correctly"""
         self.db_manager.ensure_app_state_table()

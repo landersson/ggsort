@@ -219,6 +219,13 @@ class DatabaseManager:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def mark_all_detections_deleted(self, image_id: int) -> int:
+        """Mark all detections on a specific image as deleted. Returns number of detections affected."""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE detections SET deleted = 1 WHERE image_id = ?", (image_id,))
+        self.conn.commit()
+        return cursor.rowcount
+
     def close(self):
         """Close the database connection"""
         if self.conn:
@@ -454,6 +461,16 @@ class DetectionController:
         state.need_redraw = True
         return success
 
+    def mark_all_detections_deleted(self, image_id: int) -> bool:
+        """Mark all detections on the current image as deleted"""
+        affected_count = self.db_manager.mark_all_detections_deleted(image_id)
+        if affected_count > 0:
+            print(f"Marked {affected_count} detection(s) as deleted on current image")
+            return True
+        else:
+            print("No detections found to mark as deleted")
+            return False
+
 class UserInterface:
     """Handles user interface operations"""
     def __init__(self, controller: DetectionController, renderer: DetectionRenderer, state: AppState):
@@ -482,7 +499,7 @@ class UserInterface:
             
             self.state.need_redraw = True
 
-    def handle_key_press(self, key: int, original_img) -> Optional[int]:
+    def handle_key_press(self, key: int, original_img, image_id: int = None) -> Optional[int]:
         """Handle key press events. Returns navigation command or None"""
         # print(f"Key pressed: {key}")
         
@@ -502,6 +519,13 @@ class UserInterface:
                     print(f"Failed to toggle deleted status for detection {self.state.selected_detection_id}")
             else:
                 print("No detection selected. Hover over a detection to select it.")
+        elif key == 122:  # 'z' key for marking all detections as deleted
+            if image_id is not None:
+                success = self.controller.mark_all_detections_deleted(image_id)
+                if success:
+                    self.state.need_redraw = True
+            else:
+                print("Error: No image ID available for marking detections as deleted")
         elif key == 99:  # 'c' key for relocation mode
             self.controller.handle_relocation_mode(self.state)
         elif key == 9:  # TAB key for cycling through overlapping detections
@@ -551,7 +575,7 @@ class UserInterface:
         
         print(f"Showing {image_path} with {len(detections)} detection(s)")
         print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
-              f"p = mark as possum, o = mark as other, c = relocate detection, TAB = cycle overlapping detections, ESC = exit")
+              f"z = delete all detections, p = mark as possum, o = mark as other, c = relocate detection, TAB = cycle overlapping detections, ESC = exit")
         
         # Save position
         db_manager.save_last_image_index(current_index)
@@ -580,7 +604,7 @@ class UserInterface:
             if key == 255:
                 continue
             
-            result = self.handle_key_press(key, original_img)
+            result = self.handle_key_press(key, original_img, image_id)
             if result is not None:
                 if result == 0:
                     db_manager.save_last_image_index(current_index)

@@ -245,6 +245,44 @@ class TestUserInterface(unittest.TestCase):
         self.mock_controller.cycle_overlapping_detections.assert_not_called()
         self.mock_controller.handle_category_change.assert_not_called()
     
+    def test_handle_key_press_delete_all_detections_success(self):
+        """Test 'z' key for marking all detections as deleted"""
+        # Setup: Mock the controller method to return success
+        self.mock_controller.mark_all_detections_deleted.return_value = True
+        
+        with patch('builtins.print') as mock_print:
+            # Test 'z' key (122)
+            result = self.ui.handle_key_press(122, self.test_image, image_id=1)
+        
+        # Verify behavior
+        self.assertIsNone(result)  # Should not navigate
+        self.assertTrue(self.state.need_redraw)  # Should trigger redraw
+        self.mock_controller.mark_all_detections_deleted.assert_called_once_with(1)
+    
+    def test_handle_key_press_delete_all_detections_failure(self):
+        """Test 'z' key when marking all detections fails"""
+        # Setup: Mock the controller method to return failure
+        self.mock_controller.mark_all_detections_deleted.return_value = False
+        
+        with patch('builtins.print') as mock_print:
+            result = self.ui.handle_key_press(122, self.test_image, image_id=1)
+        
+        # Verify behavior
+        self.assertIsNone(result)  # Should not navigate
+        self.assertFalse(self.state.need_redraw)  # Should not redraw on failure
+        self.mock_controller.mark_all_detections_deleted.assert_called_once_with(1)
+    
+    def test_handle_key_press_delete_all_detections_no_image_id(self):
+        """Test 'z' key when no image ID is provided"""
+        with patch('builtins.print') as mock_print:
+            result = self.ui.handle_key_press(122, self.test_image, image_id=None)
+        
+        # Verify behavior
+        self.assertIsNone(result)  # Should not navigate
+        self.assertFalse(self.state.need_redraw)  # Should not redraw
+        self.mock_controller.mark_all_detections_deleted.assert_not_called()
+        mock_print.assert_called_with("Error: No image ID available for marking detections as deleted")
+    
     @patch('cv2.imread')
     @patch('cv2.namedWindow')
     @patch('cv2.setMouseCallback')
