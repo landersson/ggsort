@@ -193,7 +193,7 @@ def main():
                 continue
 
             # Extract DateTimeOriginal from EXIF data
-            print(f"Processing image: {full_path}")
+            # print(f"Processing image: {full_path}")
             datetime_original = get_datetime_original(full_path)
             if datetime_original:
                 images_with_exif += 1
