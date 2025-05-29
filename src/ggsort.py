@@ -161,7 +161,7 @@ class DatabaseManager:
         """Get detections for a specific image from the database"""
         cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT id, category, confidence, x, y, width, height, deleted, subcategory 
+            SELECT id, category, confidence, x, y, width, height, deleted, subcategory, hard
             FROM detections 
             WHERE image_id = ? AND confidence >= ?
             ORDER BY confidence DESC
@@ -178,7 +178,8 @@ class DatabaseManager:
                 width=row['width'],
                 height=row['height'],
                 deleted=bool(row['deleted']),
-                subcategory=row['subcategory']
+                subcategory=row['subcategory'],
+                hard=bool(row['hard']) if row['hard'] is not None else False
             )
             detections.append(detection)
         return detections
@@ -197,6 +198,24 @@ class DatabaseManager:
         new_status = 1 if current_status == 0 else 0
         
         cursor.execute("UPDATE detections SET deleted = ? WHERE id = ?", (new_status, detection_id))
+        self.conn.commit()
+        
+        return cursor.rowcount > 0
+
+    def toggle_detection_hard_flag(self, detection_id: int) -> bool:
+        """Toggle the hard flag of a detection in the database"""
+        cursor = self.conn.cursor()
+        
+        cursor.execute("SELECT hard FROM detections WHERE id = ?", (detection_id,))
+        result = cursor.fetchone()
+        
+        if result is None:
+            return False
+        
+        current_status = result['hard']
+        new_status = 1 if current_status == 0 else 0
+        
+        cursor.execute("UPDATE detections SET hard = ? WHERE id = ?", (new_status, detection_id))
         self.conn.commit()
         
         return cursor.rowcount > 0
@@ -334,6 +353,9 @@ class DetectionRenderer:
         """Draw the detection label"""
         category_name = self.categories.get(box.category, 'unknown')
         label = f"{category_name}: {box.confidence:.2f}"
+        
+        if box.detection.hard:
+            label += " (HARD!)"
         
         if box.is_deleted:
             label += " (DELETED)"
@@ -526,6 +548,16 @@ class UserInterface:
                     self.state.need_redraw = True
             else:
                 print("Error: No image ID available for marking detections as deleted")
+        elif key == 104:  # 'h' key for toggling hard flag
+            if self.state.selected_detection_id is not None:
+                success = self.controller.db_manager.toggle_detection_hard_flag(self.state.selected_detection_id)
+                if success:
+                    print(f"Toggled hard flag for detection {self.state.selected_detection_id}")
+                    self.state.need_redraw = True
+                else:
+                    print(f"Failed to toggle hard flag for detection {self.state.selected_detection_id}")
+            else:
+                print("No detection selected. Hover over a detection to select it.")
         elif key == 99:  # 'c' key for relocation mode
             self.controller.handle_relocation_mode(self.state)
         elif key == 9:  # TAB key for cycling through overlapping detections
@@ -574,8 +606,8 @@ class UserInterface:
         display_text = f"{current_index+1} / {total_images} : {basename}"
         
         print(f"Showing {image_path} with {len(detections)} detection(s)")
-        print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
-              f"z = delete all detections, p = mark as possum, o = mark as other, c = relocate detection, TAB = cycle overlapping detections, ESC = exit")
+        # print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
+        #       f"z = delete all detections, h = toggle hard flag, p = mark as possum, o = mark as other, c = relocate detection, TAB = cycle overlapping detections, ESC = exit")
         
         # Save position
         db_manager.save_last_image_index(current_index)

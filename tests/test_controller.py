@@ -328,5 +328,33 @@ class TestDetectionController(unittest.TestCase):
             1, 0.1, 0.25, 0.3, 0.5
         )
 
+    def test_mark_all_detections_deleted_success(self):
+        """Test successfully marking all detections as deleted"""
+        # Setup
+        self.mock_db_manager.mark_all_detections_deleted.return_value = 3
+        
+        # Execute
+        with patch('builtins.print') as mock_print:
+            result = self.controller.mark_all_detections_deleted(1)
+        
+        # Verify
+        self.assertTrue(result)
+        self.mock_db_manager.mark_all_detections_deleted.assert_called_once_with(1)
+        mock_print.assert_called_with("Marked 3 detection(s) as deleted on current image")
+    
+    def test_mark_all_detections_deleted_no_detections(self):
+        """Test marking all detections as deleted when no detections exist"""
+        # Setup
+        self.mock_db_manager.mark_all_detections_deleted.return_value = 0
+        
+        # Execute
+        with patch('builtins.print') as mock_print:
+            result = self.controller.mark_all_detections_deleted(1)
+        
+        # Verify
+        self.assertFalse(result)
+        self.mock_db_manager.mark_all_detections_deleted.assert_called_once_with(1)
+        mock_print.assert_called_with("No detections found to mark as deleted")
+
 if __name__ == '__main__':
     unittest.main() 
