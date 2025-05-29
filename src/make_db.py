@@ -173,6 +173,10 @@ def main():
             
             # Filter out detections with confidence below threshold
             all_detections = img.get('detections', [])
+            if all_detections is None:
+                print(f"Warning: No detections found for image: {full_path}")
+                continue
+            
             valid_detections = []
             for detection in all_detections:
                 confidence = detection.get('conf', 0.0)
@@ -189,6 +193,7 @@ def main():
                 continue
 
             # Extract DateTimeOriginal from EXIF data
+            print(f"Processing image: {full_path}")
             datetime_original = get_datetime_original(full_path)
             if datetime_original:
                 images_with_exif += 1
@@ -233,7 +238,8 @@ def main():
     except Exception as e:
         conn.rollback()
         print(f"Unexpected error: {e}", file=sys.stderr)
-        return 1
+        raise
+
     finally:
         conn.close()
     
