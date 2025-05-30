@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from ggsort import (
     UserInterface, DetectionController, DetectionRenderer, AppState, 
-    DatabaseManager, Detection, CATEGORY_KEYS
+    DatabaseManager, Detection, CATEGORY_KEYS, CATEGORY_KEYS_ALL
 )
 
 class TestUserInterface(unittest.TestCase):
@@ -196,7 +196,7 @@ class TestUserInterface(unittest.TestCase):
         
         self.assertIsNone(result)
         self.assertTrue(self.state.need_redraw)
-        self.mock_controller.handle_category_change.assert_called_once_with(1, CATEGORY_KEYS[112])
+        self.mock_controller.handle_category_change.assert_called_once_with(1, CATEGORY_KEYS[112], None)
         
         # Test 'o' key for other (111)
         self.mock_controller.handle_category_change.reset_mock()
@@ -206,7 +206,7 @@ class TestUserInterface(unittest.TestCase):
         
         self.assertIsNone(result)
         self.assertTrue(self.state.need_redraw)
-        self.mock_controller.handle_category_change.assert_called_once_with(1, CATEGORY_KEYS[111])
+        self.mock_controller.handle_category_change.assert_called_once_with(1, CATEGORY_KEYS[111], None)
     
     def test_handle_key_press_category_change_failure(self):
         """Test category change when it fails"""
@@ -531,7 +531,7 @@ class TestUserInterfaceKeyMappings(unittest.TestCase):
                 
                 self.assertIsNone(result)
                 self.assertTrue(self.state.need_redraw)
-                self.mock_controller.handle_category_change.assert_called_once_with(1, category_info)
+                self.mock_controller.handle_category_change.assert_called_once_with(1, category_info, None)
     
     def test_delete_key_variations(self):
         """Test all delete key variations"""
@@ -573,6 +573,35 @@ class TestUserInterfaceKeyMappings(unittest.TestCase):
             with self.subTest(key=key_code, direction="exit"):
                 result = self.ui.handle_key_press(key_code, self.test_image)
                 self.assertEqual(result, 0)
+    
+    def test_uppercase_category_keys_all_detections(self):
+        """Test uppercase category change keys that change ALL detections"""
+        self.mock_controller.handle_category_change.return_value = True
+        
+        # Test all keys in CATEGORY_KEYS_ALL
+        for key_code, category_info in CATEGORY_KEYS_ALL.items():
+            with self.subTest(key=key_code, category=category_info['name']):
+                self.mock_controller.handle_category_change.reset_mock()
+                self.state.need_redraw = False
+                
+                result = self.ui.handle_key_press(key_code, self.test_image, image_id=1)
+                
+                self.assertIsNone(result)
+                self.assertTrue(self.state.need_redraw)
+                # Should call with -1 for detection_id to indicate all detections
+                self.mock_controller.handle_category_change.assert_called_once_with(-1, category_info, 1)
+
+    def test_v_key_all_other_shortcut(self):
+        """Test 'v' key for changing ALL detections to 'Other' (quick shortcut)"""
+        self.mock_controller.handle_category_change.return_value = True
+        
+        result = self.ui.handle_key_press(118, self.test_image, image_id=1)  # 'v' key
+        
+        self.assertIsNone(result)
+        self.assertTrue(self.state.need_redraw)
+        # Should call with -1 for detection_id and 'Other' category
+        expected_category_info = {'id': 5, 'name': 'Other'}
+        self.mock_controller.handle_category_change.assert_called_once_with(-1, expected_category_info, 1)
 
 
 if __name__ == '__main__':

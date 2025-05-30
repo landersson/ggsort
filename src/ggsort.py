@@ -27,6 +27,13 @@ CATEGORY_KEYS = {
     103: {'id': 1, 'name': 'GangGang'} # 'g' key
 }
 
+# Category key mappings for ALL detections in image (uppercase versions)
+CATEGORY_KEYS_ALL = {
+    80: {'id': 4, 'name': 'Possum'},   # 'P' key (Shift+p)
+    79: {'id': 5, 'name': 'Other'},    # 'O' key (Shift+o)
+    71: {'id': 1, 'name': 'GangGang'}  # 'G' key (Shift+g)
+}
+
 # Grey color for deleted detections
 DELETED_COLOR = (128, 128, 128)  # Grey
 
@@ -220,10 +227,18 @@ class DatabaseManager:
         
         return cursor.rowcount > 0
 
-    def update_detection_category(self, detection_id: int, category_id: int) -> bool:
-        """Update the category of a detection in the database"""
+    def update_detection_category(self, detection_id: int, category_id: int, image_id: Optional[int] = None) -> bool:
+        """Update the category of a detection in the database.
+        If detection_id is negative and image_id is provided, updates all detections in the image."""
         cursor = self.conn.cursor()
-        cursor.execute("UPDATE detections SET category = ? WHERE id = ?", (category_id, detection_id))
+        
+        if detection_id < 0 and image_id is not None:
+            # Update all detections in the image
+            cursor.execute("UPDATE detections SET category = ? WHERE image_id = ?", (category_id, image_id))
+        else:
+            # Update specific detection
+            cursor.execute("UPDATE detections SET category = ? WHERE id = ?", (category_id, detection_id))
+        
         self.conn.commit()
         return cursor.rowcount > 0
 
@@ -392,19 +407,31 @@ class DetectionController:
         self.db_manager = db_manager
         self.renderer = renderer
 
-    def handle_category_change(self, detection_id: Optional[int], category_info: Dict[str, Any]) -> bool:
-        """Handle changing a detection's category"""
+    def handle_category_change(self, detection_id: Optional[int], category_info: Dict[str, Any], image_id: Optional[int] = None) -> bool:
+        """Handle changing a detection's category.
+        If detection_id is negative and image_id is provided, changes all detections in the image."""
         if detection_id is None:
             print("No detection selected. Hover over a detection to select it.")
             return False
         
-        success = self.db_manager.update_detection_category(detection_id, category_info['id'])
-        if success:
-            print(f"Changed detection {detection_id} category to {category_info['name']}")
-            return True
+        if detection_id < 0 and image_id is not None:
+            # Update all detections in the image
+            success = self.db_manager.update_detection_category(detection_id, category_info['id'], image_id)
+            if success:
+                print(f"Changed all detections in image {image_id} to category {category_info['name']}")
+                return True
+            else:
+                print(f"Failed to change all detections in image {image_id} to category {category_info['name']}")
+                return False
         else:
-            print(f"Failed to change detection {detection_id} category")
-            return False
+            # Update specific detection
+            success = self.db_manager.update_detection_category(detection_id, category_info['id'])
+            if success:
+                print(f"Changed detection {detection_id} category to {category_info['name']}")
+                return True
+            else:
+                print(f"Failed to change detection {detection_id} category")
+                return False
 
     def cycle_overlapping_detections(self, state: AppState) -> bool:
         """Cycle through overlapping detections under the mouse cursor"""
@@ -563,7 +590,14 @@ class UserInterface:
         elif key == 9:  # TAB key for cycling through overlapping detections
             self.controller.cycle_overlapping_detections(self.state)
         elif key in CATEGORY_KEYS:  # Category change keys (p, o, etc.)
-            if self.controller.handle_category_change(self.state.selected_detection_id, CATEGORY_KEYS[key]):
+            if self.controller.handle_category_change(self.state.selected_detection_id, CATEGORY_KEYS[key], image_id):
+                self.state.need_redraw = True
+        elif key in CATEGORY_KEYS_ALL:  # Category change keys for ALL detections in image (uppercase versions)
+            if self.controller.handle_category_change(-1, CATEGORY_KEYS_ALL[key], image_id):
+                self.state.need_redraw = True
+        elif key == 118:  # 'v' key for changing ALL detections to 'Other' (convenient shortcut)
+            category_info = {'id': 5, 'name': 'Other'}
+            if self.controller.handle_category_change(-1, category_info, image_id):
                 self.state.need_redraw = True
         
         # Note: Relocation completion is now handled in mouse_callback when second click is made
@@ -606,8 +640,10 @@ class UserInterface:
         display_text = f"{current_index+1} / {total_images} : {basename}"
         
         print(f"Showing {image_path} with {len(detections)} detection(s)")
-        # print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
-        #       f"z = delete all detections, h = toggle hard flag, p = mark as possum, o = mark as other, c = relocate detection, TAB = cycle overlapping detections, ESC = exit")
+        print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
+              f"z = delete all detections, h = toggle hard flag, p = mark as possum, o = mark as other, g = mark as ganggang, "
+              f"P = mark ALL as possum, O = mark ALL as other, G = mark ALL as ganggang, v = mark ALL as other (quick), "
+              f"c = relocate detection, TAB = cycle overlapping detections, ESC = exit")
         
         # Save position
         db_manager.save_last_image_index(current_index)
