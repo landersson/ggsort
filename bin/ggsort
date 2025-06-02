@@ -32,15 +32,15 @@ if [ ! -f $JSON_FILE ]; then
     fi
 fi
 
-DB_FILE=$BASE_DIR/dbs/${LOCATION}.db
+DB_FILE="$BASE_DIR/dbs/${LOCATION}.db"
 
-if [ ! -f $DB_FILE ]; then
+if [ ! -f "$DB_FILE" ]; then
     echo "Creating new database file $DB_FILE"
     if ! python $BASE_DIR/src/make_db.py \
-        --base-dir $LOCATION \
-        --image-dir $IMAGE_DIR \
+        --base-dir "$LOCATION" \
+        --image-dir "$IMAGE_DIR" \
         --conf-threshold 0.05 \
-        --output $DB_FILE; then
+        --output "$DB_FILE"; then
         echo "Error: Failed to create database file"
         exit 1
     fi
@@ -49,5 +49,5 @@ else
 fi
 
 python $BASE_DIR/src/ggsort.py \
-    --db-file $DB_FILE \
-    --image-dir $IMAGE_DIR
+    --db-file "$DB_FILE" \
+    --image-dir "$IMAGE_DIR"
