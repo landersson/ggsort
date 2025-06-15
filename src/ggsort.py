@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 # Configuration
 CONFIDENCE_THRESHOLD = 0.0  # Only display detections with confidence above this threshold
+AUTODELETE_PIXEL_THRESHOLD = 20  # Pixel threshold for autodelete rectangle matching
 
 # Color mapping for different categories (in BGR format)
 COLORS = {
@@ -37,6 +38,10 @@ CATEGORY_KEYS_ALL = {
 # Grey color for deleted detections
 DELETED_COLOR = (128, 128, 128)  # Grey
 
+# Color for autodelete template rectangles
+TEMPLATE_COLOR = (128, 128, 128)  # Grey
+TEMPLATE_LINE_WIDTH = 2
+
 @dataclass
 class Detection:
     """Represents a single detection with its properties"""
@@ -50,6 +55,18 @@ class Detection:
     deleted: bool = False
     subcategory: Optional[int] = None
     hard: bool = False
+
+@dataclass
+class AutodeleteTemplate:
+    """Represents an autodelete template rectangle"""
+    id: int
+    x: float  # normalized coordinates
+    y: float
+    width: float
+    height: float
+    image_width: int  # original image dimensions for pixel matching
+    image_height: int
+    description: str = ""
 
 @dataclass
 class BoundingBox:
@@ -121,6 +138,24 @@ class DatabaseManager:
             CREATE TABLE IF NOT EXISTS app_state (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+        """)
+        self.conn.commit()
+
+    def ensure_autodelete_table(self):
+        """Ensure autodelete_templates table exists in the database"""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS autodelete_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                width REAL NOT NULL,
+                height REAL NOT NULL,
+                image_width INTEGER NOT NULL,
+                image_height INTEGER NOT NULL,
+                description TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         self.conn.commit()
@@ -260,6 +295,91 @@ class DatabaseManager:
         self.conn.commit()
         return cursor.rowcount
 
+    def add_autodelete_template(self, detection: Detection, image_width: int, image_height: int, description: str = "") -> bool:
+        """Add a new autodelete template based on a detection"""
+        self.ensure_autodelete_table()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO autodelete_templates (x, y, width, height, image_width, image_height, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (detection.x, detection.y, detection.width, detection.height, image_width, image_height, description))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_autodelete_templates(self) -> List[AutodeleteTemplate]:
+        """Get all autodelete templates from the database"""
+        self.ensure_autodelete_table()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT id, x, y, width, height, image_width, image_height, description
+            FROM autodelete_templates
+            ORDER BY id
+        """)
+        
+        templates = []
+        for row in cursor.fetchall():
+            template = AutodeleteTemplate(
+                id=row['id'],
+                x=row['x'],
+                y=row['y'],
+                width=row['width'],
+                height=row['height'],
+                image_width=row['image_width'],
+                image_height=row['image_height'],
+                description=row['description'] or ""
+            )
+            templates.append(template)
+        return templates
+
+    def is_detection_similar_to_template(self, detection: Detection, template: AutodeleteTemplate, image_width: int, image_height: int) -> bool:
+        """Check if a detection is similar to an autodelete template (within pixel threshold)"""
+        # Convert detection to pixel coordinates
+        det_x1 = int(detection.x * image_width)
+        det_y1 = int(detection.y * image_height)
+        det_x2 = int((detection.x + detection.width) * image_width)
+        det_y2 = int((detection.y + detection.height) * image_height)
+        
+        # Convert template to pixel coordinates (scale from original image size)
+        scale_x = image_width / template.image_width
+        scale_y = image_height / template.image_height
+        
+        temp_x1 = int(template.x * template.image_width * scale_x)
+        temp_y1 = int(template.y * template.image_height * scale_y)
+        temp_x2 = int((template.x + template.width) * template.image_width * scale_x)
+        temp_y2 = int((template.y + template.height) * template.image_height * scale_y)
+        
+        # Check if all corners are within threshold
+        threshold = AUTODELETE_PIXEL_THRESHOLD
+        return (abs(det_x1 - temp_x1) <= threshold and
+                abs(det_y1 - temp_y1) <= threshold and
+                abs(det_x2 - temp_x2) <= threshold and
+                abs(det_y2 - temp_y2) <= threshold)
+
+    def auto_delete_similar_detections(self, image_id: int, image_width: int, image_height: int) -> int:
+        """Automatically delete detections similar to autodelete templates. Returns count of deleted detections."""
+        templates = self.get_autodelete_templates()
+        if not templates:
+            return 0
+        
+        # Get all non-deleted detections for this image
+        detections = self.get_detections_for_image(image_id, 0.0)  # Get all detections regardless of confidence
+        non_deleted_detections = [d for d in detections if not d.deleted]
+        
+        deleted_count = 0
+        for detection in non_deleted_detections:
+            for template in templates:
+                if self.is_detection_similar_to_template(detection, template, image_width, image_height):
+                    # Mark this detection as deleted
+                    cursor = self.conn.cursor()
+                    cursor.execute("UPDATE detections SET deleted = 1 WHERE id = ?", (detection.id,))
+                    deleted_count += 1
+                    break  # Only need to match one template
+        
+        if deleted_count > 0:
+            self.conn.commit()
+        
+        return deleted_count
+
     def close(self):
         """Close the database connection"""
         if self.conn:
@@ -297,7 +417,7 @@ class DetectionRenderer:
                 overlapping.append(box)
         return overlapping
 
-    def draw_boxes_on_image(self, original_img, detections: List[Detection], state: AppState) -> Any:
+    def draw_boxes_on_image(self, original_img, detections: List[Detection], state: AppState, db_manager=None) -> Any:
         """Draw bounding boxes on a copy of the original image"""
         img_copy = original_img.copy()
         height, width = img_copy.shape[:2]
@@ -329,6 +449,10 @@ class DetectionRenderer:
             else:
                 state.current_overlap_index = 0
                 state.selected_detection_id = None
+        
+        # Draw autodelete template rectangles (for debugging)
+        if db_manager is not None:
+            self._draw_autodelete_templates(img_copy, db_manager, width, height)
         
         # Draw all detection boxes
         for box in detection_boxes:
@@ -384,6 +508,32 @@ class DetectionRenderer:
                      (box.x_min + text_width + 2, box.y_min - 6), (0, 0, 0), -1)
         cv2.putText(img_copy, label, (box.x_min, box.y_min - 15), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+    def _draw_autodelete_templates(self, img_copy, db_manager, img_width: int, img_height: int):
+        """Draw autodelete template rectangles for debugging"""
+        templates = db_manager.get_autodelete_templates()
+        
+        for template in templates:
+            # Scale template coordinates to current image size
+            scale_x = img_width / template.image_width
+            scale_y = img_height / template.image_height
+            
+            # Convert normalized coordinates to pixel coordinates with scaling
+            x1 = int(template.x * template.image_width * scale_x)
+            y1 = int(template.y * template.image_height * scale_y)
+            x2 = int((template.x + template.width) * template.image_width * scale_x)
+            y2 = int((template.y + template.height) * template.image_height * scale_y)
+            
+            # Draw template rectangle
+            cv2.rectangle(img_copy, (x1, y1), (x2, y2), TEMPLATE_COLOR, TEMPLATE_LINE_WIDTH)
+            
+            # Add small label to identify it as a template
+            label = f"T{template.id}"
+            (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(img_copy, (x1 - 1, y1 - text_height - 5), 
+                         (x1 + text_width + 1, y1 - 2), TEMPLATE_COLOR, -1)
+            cv2.putText(img_copy, label, (x1, y1 - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     def _draw_relocation_ui(self, img_copy, state: AppState):
         """Draw relocation mode UI elements"""
@@ -520,6 +670,31 @@ class DetectionController:
             print("No detections found to mark as deleted")
             return False
 
+    def add_autodelete_template(self, detection_id: int, original_img, state: AppState) -> bool:
+        """Add a detection as an autodelete template"""
+        # Find the detection in current boxes
+        detection = None
+        for box in state.current_boxes:
+            if box.detection_id == detection_id:
+                detection = box.detection
+                break
+        
+        if detection is None:
+            print(f"Could not find detection {detection_id} to add as autodelete template")
+            return False
+        
+        height, width = original_img.shape[:2]
+        description = f"Template from detection {detection_id}"
+        
+        success = self.db_manager.add_autodelete_template(detection, width, height, description)
+        if success:
+            print(f"Added detection {detection_id} as autodelete template")
+            print(f"Template location: x={detection.x:.3f}, y={detection.y:.3f}, w={detection.width:.3f}, h={detection.height:.3f}")
+            return True
+        else:
+            print(f"Failed to add detection {detection_id} as autodelete template")
+            return False
+
 class UserInterface:
     """Handles user interface operations"""
     def __init__(self, controller: DetectionController, renderer: DetectionRenderer, state: AppState):
@@ -585,6 +760,13 @@ class UserInterface:
                     print(f"Failed to toggle hard flag for detection {self.state.selected_detection_id}")
             else:
                 print("No detection selected. Hover over a detection to select it.")
+        elif key == 75:  # 'K' key (Shift+k) for adding autodelete template
+            if self.state.selected_detection_id is not None and original_img is not None:
+                success = self.controller.add_autodelete_template(self.state.selected_detection_id, original_img, self.state)
+                if success:
+                    self.state.need_redraw = True
+            else:
+                print("No detection selected or no image available. Hover over a detection to select it.")
         elif key == 99:  # 'c' key for relocation mode
             self.controller.handle_relocation_mode(self.state)
         elif key == 9:  # TAB key for cycling through overlapping detections
@@ -635,6 +817,13 @@ class UserInterface:
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
         
+        # Auto-delete similar detections before displaying
+        auto_deleted_count = db_manager.auto_delete_similar_detections(image_id, original_img.shape[1], original_img.shape[0])
+        if auto_deleted_count > 0:
+            print(f"Auto-deleted {auto_deleted_count} detection(s) matching autodelete templates")
+            # Refresh detections after auto-deletion
+            detections = db_manager.get_detections_for_image(image_id, confidence_threshold)
+        
         # Display info
         basename = os.path.basename(image_path)
         display_text = f"{current_index+1} / {total_images} : {basename}"
@@ -643,7 +832,7 @@ class UserInterface:
         print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
               f"z = delete all detections, h = toggle hard flag, p = mark as possum, o = mark as other, g = mark as ganggang, "
               f"P = mark ALL as possum, O = mark ALL as other, G = mark ALL as ganggang, v = mark ALL as other (quick), "
-              f"c = relocate detection, TAB = cycle overlapping detections, ESC = exit")
+              f"c = relocate detection, Shift+K = add autodelete template, TAB = cycle overlapping detections, ESC = exit")
         
         # Save position
         db_manager.save_last_image_index(current_index)
@@ -655,7 +844,7 @@ class UserInterface:
             if self.state.need_redraw:
                 # Refresh detections and redraw
                 detections = db_manager.get_detections_for_image(image_id, confidence_threshold)
-                updated_img = self.renderer.draw_boxes_on_image(original_img, detections, self.state)
+                updated_img = self.renderer.draw_boxes_on_image(original_img, detections, self.state, db_manager)
                 
                 # Add filename text
                 text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
