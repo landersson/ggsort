@@ -380,6 +380,19 @@ class DatabaseManager:
         
         return deleted_count
 
+    def clear_all_autodelete_templates(self) -> int:
+        """Clear all autodelete templates from the database. Returns count of deleted templates."""
+        self.ensure_autodelete_table()
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM autodelete_templates")
+        count = cursor.fetchone()[0]
+        
+        if count > 0:
+            cursor.execute("DELETE FROM autodelete_templates")
+            self.conn.commit()
+        
+        return count
+
     def close(self):
         """Close the database connection"""
         if self.conn:
@@ -695,6 +708,16 @@ class DetectionController:
             print(f"Failed to add detection {detection_id} as autodelete template")
             return False
 
+    def clear_all_autodelete_templates(self) -> bool:
+        """Clear all autodelete templates from the database"""
+        count = self.db_manager.clear_all_autodelete_templates()
+        if count > 0:
+            print(f"Cleared {count} autodelete template(s) from database")
+            return True
+        else:
+            print("No autodelete templates found to clear")
+            return False
+
 class UserInterface:
     """Handles user interface operations"""
     def __init__(self, controller: DetectionController, renderer: DetectionRenderer, state: AppState):
@@ -767,6 +790,10 @@ class UserInterface:
                     self.state.need_redraw = True
             else:
                 print("No detection selected or no image available. Hover over a detection to select it.")
+        elif key == 82:  # 'R' key (Shift+r) for clearing all autodelete templates
+            success = self.controller.clear_all_autodelete_templates()
+            if success:
+                self.state.need_redraw = True
         elif key == 99:  # 'c' key for relocation mode
             self.controller.handle_relocation_mode(self.state)
         elif key == 9:  # TAB key for cycling through overlapping detections
@@ -832,7 +859,7 @@ class UserInterface:
         print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
               f"z = delete all detections, h = toggle hard flag, p = mark as possum, o = mark as other, g = mark as ganggang, "
               f"P = mark ALL as possum, O = mark ALL as other, G = mark ALL as ganggang, v = mark ALL as other (quick), "
-              f"c = relocate detection, Shift+K = add autodelete template, TAB = cycle overlapping detections, ESC = exit")
+              f"c = relocate detection, Shift+K = add autodelete template, Shift+R = clear all templates, TAB = cycle overlapping detections, ESC = exit")
         
         # Save position
         db_manager.save_last_image_index(current_index)
@@ -884,6 +911,8 @@ class GGSortApplication:
         self.image_dir = image_dir
         self.confidence_threshold = confidence_threshold
         self.start_index = start_index
+        
+        
 
     def run(self) -> int:
         """Run the main application"""
