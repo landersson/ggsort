@@ -12,6 +12,11 @@ from dataclasses import dataclass
 CONFIDENCE_THRESHOLD = 0.0  # Only display detections with confidence above this threshold
 AUTODELETE_PIXEL_THRESHOLD = 20  # Pixel threshold for autodelete rectangle matching
 
+# Corner knob configuration
+CORNER_PROXIMITY_THRESHOLD = 60  # Pixels - show corner knobs when mouse is within this distance
+CORNER_KNOB_RADIUS = 20  # Radius of corner knobs in pixels
+CORNER_KNOB_COLOR = (180, 180, 180)  # Light grey  color for corner knobs
+
 # Color mapping for different categories (in BGR format)
 COLORS = {
     '1': (0, 0, 255),    # Red for GangGangs
@@ -98,6 +103,16 @@ class AppState:
         # Overlapping detections state
         self.overlapping_detections: List[BoundingBox] = []
         self.current_overlap_index: int = 0
+        
+        # Corner dragging state
+        self.corner_dragging_mode: bool = False
+        self.dragged_corner_detection_id: Optional[int] = None
+        self.dragged_corner_type: Optional[str] = None  # 'top-left', 'top-right', 'bottom-left', 'bottom-right'
+        self.original_detection_coords: Optional[Tuple[float, float, float, float]] = None  # x, y, width, height
+        self.drag_start_mouse_pos: Optional[Tuple[int, int]] = None
+        
+        # Performance optimization for dragging
+        self.last_drag_redraw_pos: Optional[Tuple[int, int]] = None
 
     def reset_relocation_mode(self):
         """Reset relocation mode state"""
@@ -110,11 +125,51 @@ class AppState:
         self.overlapping_detections = []
         self.current_overlap_index = 0
 
+    def reset_corner_dragging_mode(self):
+        """Reset corner dragging mode state"""
+        self.corner_dragging_mode = False
+        self.dragged_corner_detection_id = None
+        self.dragged_corner_type = None
+        self.original_detection_coords = None
+        self.drag_start_mouse_pos = None
+        self.last_drag_redraw_pos = None
+
+    def get_corner_type(self, box: BoundingBox, corner_x: int, corner_y: int) -> str:
+        """Determine which corner of the box the coordinates represent"""
+        if corner_x == box.x_min and corner_y == box.y_min:
+            return 'top-left'
+        elif corner_x == box.x_max and corner_y == box.y_min:
+            return 'top-right'
+        elif corner_x == box.x_min and corner_y == box.y_max:
+            return 'bottom-left'
+        elif corner_x == box.x_max and corner_y == box.y_max:
+            return 'bottom-right'
+        else:
+            return 'unknown'
+
     def update_mouse_position(self, x: int, y: int):
         """Update mouse position and trigger redraw"""
         self.mouse_x = x
         self.mouse_y = y
         self.need_redraw = True
+
+    def should_redraw_for_drag(self, x: int, y: int, threshold: int = 3) -> bool:
+        """Check if we should redraw during corner dragging based on mouse movement threshold"""
+        if not self.corner_dragging_mode:
+            return True
+        
+        if self.last_drag_redraw_pos is None:
+            self.last_drag_redraw_pos = (x, y)
+            return True
+        
+        last_x, last_y = self.last_drag_redraw_pos
+        distance = ((x - last_x) ** 2 + (y - last_y) ** 2) ** 0.5
+        
+        if distance >= threshold:
+            self.last_drag_redraw_pos = (x, y)
+            return True
+        
+        return False
 
 class DatabaseManager:
     """Handles all database operations"""
@@ -430,6 +485,60 @@ class DetectionRenderer:
                 overlapping.append(box)
         return overlapping
 
+    def find_closest_corner(self, boxes: List[BoundingBox], mouse_x: int, mouse_y: int, threshold: int = CORNER_PROXIMITY_THRESHOLD) -> Optional[Tuple[int, int, int]]:
+        """Find the closest corner across all non-deleted detection boxes. Returns (corner_x, corner_y, detection_id) or None."""
+        closest_corner = None
+        closest_distance = float('inf')
+        closest_detection_id = None
+        
+        for box in boxes:
+            # Skip deleted detections
+            if box.is_deleted:
+                continue
+                
+            corners = [
+                (box.x_min, box.y_min),  # top-left
+                (box.x_max, box.y_min),  # top-right
+                (box.x_min, box.y_max),  # bottom-left
+                (box.x_max, box.y_max)   # bottom-right
+            ]
+            
+            for corner_x, corner_y in corners:
+                distance = ((mouse_x - corner_x) ** 2 + (mouse_y - corner_y) ** 2) ** 0.5
+                if distance <= threshold and distance < closest_distance:
+                    closest_distance = distance
+                    closest_corner = (corner_x, corner_y)
+                    closest_detection_id = box.detection_id
+        
+        if closest_corner is not None:
+            return (closest_corner[0], closest_corner[1], closest_detection_id)
+        return None
+
+    def is_mouse_near_corner(self, box: BoundingBox, mouse_x: int, mouse_y: int, threshold: int = CORNER_PROXIMITY_THRESHOLD) -> List[Tuple[int, int]]:
+        """Check if mouse is near any corner of the bounding box. Returns list of corners that are close."""
+        corners = [
+            (box.x_min, box.y_min),  # top-left
+            (box.x_max, box.y_min),  # top-right
+            (box.x_min, box.y_max),  # bottom-left
+            (box.x_max, box.y_max)   # bottom-right
+        ]
+        
+        close_corners = []
+        for corner_x, corner_y in corners:
+            distance = ((mouse_x - corner_x) ** 2 + (mouse_y - corner_y) ** 2) ** 0.5
+            if distance <= threshold:
+                close_corners.append((corner_x, corner_y))
+        
+        return close_corners
+
+    def draw_corner_knobs(self, img_copy, corners: List[Tuple[int, int]], color: Tuple[int, int, int] = CORNER_KNOB_COLOR):
+        """Draw circular knobs at the specified corner positions"""
+        for corner_x, corner_y in corners:
+            # Draw filled circle
+            cv2.circle(img_copy, (corner_x, corner_y), CORNER_KNOB_RADIUS, color, -1)
+            # Draw black outline
+            cv2.circle(img_copy, (corner_x, corner_y), CORNER_KNOB_RADIUS, (0, 0, 0), 2)
+
     def draw_boxes_on_image(self, original_img, detections: List[Detection], state: AppState, db_manager=None) -> Any:
         """Draw bounding boxes on a copy of the original image"""
         img_copy = original_img.copy()
@@ -443,8 +552,11 @@ class DetectionRenderer:
         
         state.current_boxes = detection_boxes
         
-        # Handle overlapping detections (only if not in relocation mode)
-        if not state.relocation_mode:
+        # Find the closest corner across all non-deleted detections
+        closest_corner_info = self.find_closest_corner(detection_boxes, state.mouse_x, state.mouse_y)
+        
+        # Handle overlapping detections (only if not in relocation mode and not dragging)
+        if not state.relocation_mode and not state.corner_dragging_mode:
             current_overlapping = self.find_overlapping_detections(detection_boxes, state.mouse_x, state.mouse_y)
             
             # Check if overlapping detections changed
@@ -463,24 +575,25 @@ class DetectionRenderer:
                 state.current_overlap_index = 0
                 state.selected_detection_id = None
         
-        # Draw autodelete template rectangles (for debugging)
-        if db_manager is not None:
+        # Draw autodelete template rectangles (skip during corner dragging for performance)
+        if db_manager is not None and not state.corner_dragging_mode:
             self._draw_autodelete_templates(img_copy, db_manager, width, height)
         
         # Draw all detection boxes
         for box in detection_boxes:
-            self._draw_single_box(img_copy, box, state)
+            self._draw_single_box(img_copy, box, state, closest_corner_info)
         
-        # Draw relocation UI elements
-        if state.relocation_mode:
+        # Draw relocation UI elements (skip during corner dragging)
+        if state.relocation_mode and not state.corner_dragging_mode:
             self._draw_relocation_ui(img_copy, state)
         
         return img_copy
 
-    def _draw_single_box(self, img_copy, box: BoundingBox, state: AppState):
+    def _draw_single_box(self, img_copy, box: BoundingBox, state: AppState, closest_corner_info: Optional[Tuple[int, int, int]]):
         """Draw a single detection box"""
         is_selected = (box.detection_id == state.selected_detection_id)
         is_being_relocated = (state.relocation_mode and box.detection_id == state.relocation_detection_id)
+        is_being_dragged = (state.corner_dragging_mode and box.detection_id == state.dragged_corner_detection_id)
         
         # Draw outline
         if is_selected and not state.relocation_mode:
@@ -498,8 +611,32 @@ class DetectionRenderer:
         
         cv2.rectangle(img_copy, (box.x_min, box.y_min), (box.x_max, box.y_max), color, 4)
         
-        # Draw label
-        self._draw_label(img_copy, box, state, color, is_selected)
+        # Draw corner knob if this detection has the closest corner and is not in relocation mode
+        if not state.relocation_mode:
+            # Handle dragging mode separately
+            if (state.corner_dragging_mode and 
+                state.dragged_corner_detection_id == box.detection_id):
+                # Always show white knob at mouse position when dragging this detection
+                corner_x, corner_y = state.mouse_x, state.mouse_y
+                knob_color = (255, 255, 255)  # White for dragged corner
+                self.draw_corner_knobs(img_copy, [(corner_x, corner_y)], knob_color)
+            elif (closest_corner_info is not None and 
+                  closest_corner_info[2] == box.detection_id):
+                # Show knob at corner position when not dragging
+                corner_x, corner_y = closest_corner_info[0], closest_corner_info[1]
+                
+                # Check if mouse is within the knob radius for white color
+                distance = ((state.mouse_x - corner_x) ** 2 + (state.mouse_y - corner_y) ** 2) ** 0.5
+                if distance <= CORNER_KNOB_RADIUS:
+                    knob_color = (255, 255, 255)  # White when mouse is inside knob
+                else:
+                    knob_color = CORNER_KNOB_COLOR  # Default grey when nearby but outside knob
+                
+                self.draw_corner_knobs(img_copy, [(corner_x, corner_y)], knob_color)
+        
+        # Draw label (skip for non-dragged boxes during corner dragging for performance)
+        if not state.corner_dragging_mode or is_being_dragged:
+            self._draw_label(img_copy, box, state, color, is_selected)
 
     def _draw_label(self, img_copy, box: BoundingBox, state: AppState, color: Tuple[int, int, int], is_selected: bool):
         """Draw the detection label"""
@@ -718,6 +855,136 @@ class DetectionController:
             print("No autodelete templates found to clear")
             return False
 
+    def start_corner_dragging(self, state: AppState, closest_corner_info: Tuple[int, int, int]) -> bool:
+        """Start corner dragging mode"""
+        corner_x, corner_y, detection_id = closest_corner_info
+        
+        # Find the detection box
+        target_box = None
+        for box in state.current_boxes:
+            if box.detection_id == detection_id:
+                target_box = box
+                break
+        
+        if target_box is None:
+            return False
+        
+        # Store original coordinates
+        detection = target_box.detection
+        state.original_detection_coords = (detection.x, detection.y, detection.width, detection.height)
+        
+        # Determine corner type
+        corner_type = state.get_corner_type(target_box, corner_x, corner_y)
+        
+        # Set dragging state
+        state.corner_dragging_mode = True
+        state.dragged_corner_detection_id = detection_id
+        state.dragged_corner_type = corner_type
+        state.drag_start_mouse_pos = (state.mouse_x, state.mouse_y)
+        
+        print(f"Started dragging {corner_type} corner of detection {detection_id}")
+        return True
+
+    def update_detection_during_drag(self, state: AppState, img_width: int, img_height: int) -> bool:
+        """Update detection coordinates during corner dragging"""
+        if not state.corner_dragging_mode or state.dragged_corner_detection_id is None:
+            return False
+        
+        # Find the detection being dragged
+        target_box = None
+        for box in state.current_boxes:
+            if box.detection_id == state.dragged_corner_detection_id:
+                target_box = box
+                break
+        
+        if target_box is None:
+            return False
+        
+        # Get current mouse position in normalized coordinates
+        mouse_norm_x = max(0, min(1, state.mouse_x / img_width))
+        mouse_norm_y = max(0, min(1, state.mouse_y / img_height))
+        
+        # Get original coordinates
+        orig_x, orig_y, orig_width, orig_height = state.original_detection_coords
+        
+        # Calculate new coordinates based on corner type
+        if state.dragged_corner_type == 'top-left':
+            new_x = mouse_norm_x
+            new_y = mouse_norm_y
+            new_width = max(0.01, orig_x + orig_width - new_x)  # Ensure minimum width
+            new_height = max(0.01, orig_y + orig_height - new_y)  # Ensure minimum height
+        elif state.dragged_corner_type == 'top-right':
+            new_x = orig_x
+            new_y = mouse_norm_y
+            new_width = max(0.01, mouse_norm_x - orig_x)
+            new_height = max(0.01, orig_y + orig_height - new_y)
+        elif state.dragged_corner_type == 'bottom-left':
+            new_x = mouse_norm_x
+            new_y = orig_y
+            new_width = max(0.01, orig_x + orig_width - new_x)
+            new_height = max(0.01, mouse_norm_y - orig_y)
+        elif state.dragged_corner_type == 'bottom-right':
+            new_x = orig_x
+            new_y = orig_y
+            new_width = max(0.01, mouse_norm_x - orig_x)
+            new_height = max(0.01, mouse_norm_y - orig_y)
+        else:
+            return False
+        
+        # Ensure coordinates are within bounds
+        new_x = max(0, min(1 - new_width, new_x))
+        new_y = max(0, min(1 - new_height, new_y))
+        new_width = max(0.01, min(1 - new_x, new_width))
+        new_height = max(0.01, min(1 - new_y, new_height))
+        
+        # Update the detection object
+        target_box.detection.x = new_x
+        target_box.detection.y = new_y
+        target_box.detection.width = new_width
+        target_box.detection.height = new_height
+        
+        # Update the bounding box pixel coordinates
+        target_box.x_min = int(new_x * img_width)
+        target_box.y_min = int(new_y * img_height)
+        target_box.x_max = int((new_x + new_width) * img_width)
+        target_box.y_max = int((new_y + new_height) * img_height)
+        
+        return True
+
+    def finish_corner_dragging(self, state: AppState) -> bool:
+        """Finish corner dragging and save to database"""
+        if not state.corner_dragging_mode or state.dragged_corner_detection_id is None:
+            return False
+        
+        # Find the detection
+        target_box = None
+        for box in state.current_boxes:
+            if box.detection_id == state.dragged_corner_detection_id:
+                target_box = box
+                break
+        
+        if target_box is None:
+            state.reset_corner_dragging_mode()
+            return False
+        
+        # Save to database
+        detection = target_box.detection
+        success = self.db_manager.update_detection_coordinates(
+            state.dragged_corner_detection_id,
+            detection.x, detection.y, detection.width, detection.height
+        )
+        
+        if success:
+            print(f"Updated detection {state.dragged_corner_detection_id} coordinates: "
+                  f"x={detection.x:.3f}, y={detection.y:.3f}, w={detection.width:.3f}, h={detection.height:.3f}")
+        else:
+            print(f"Failed to update detection {state.dragged_corner_detection_id} coordinates")
+        
+        state.reset_corner_dragging_mode()
+        # Force redraw to refresh detections from database
+        state.need_redraw = True
+        return success
+
 class UserInterface:
     """Handles user interface operations"""
     def __init__(self, controller: DetectionController, renderer: DetectionRenderer, state: AppState):
@@ -730,27 +997,87 @@ class UserInterface:
     def mouse_callback(self, event, x: int, y: int, flags, param):
         """Handle mouse events"""
         if event == cv2.EVENT_MOUSEMOVE:
-            self.state.update_mouse_position(x, y)
-        elif event == cv2.EVENT_LBUTTONDOWN and self.state.relocation_mode:
-            self.state.relocation_clicks.append((x, y))
-            print(f"Click {len(self.state.relocation_clicks)}: ({x}, {y})")
+            # Always update mouse position
+            self.state.mouse_x = x
+            self.state.mouse_y = y
             
-            if len(self.state.relocation_clicks) == 2:
-                print("Two clicks recorded. Applying new coordinates...")
-                # Apply relocation immediately when second click is made
+            # During corner dragging, use optimized redraw logic
+            if self.state.corner_dragging_mode:
+                # On macOS trackpads, mouse events are less frequent during button press
+                # So we need to be more aggressive about updates
                 if self.current_original_img is not None:
-                    self.controller.apply_relocation(self.state, self.current_original_img)
-                else:
-                    print("Error: No image available for relocation")
-                    self.state.reset_relocation_mode()
-            
-            self.state.need_redraw = True
+                    height, width = self.current_original_img.shape[:2]
+                    success = self.controller.update_detection_during_drag(self.state, width, height)
+                    if success:
+                        self.state.need_redraw = True
+            else:
+                # Normal mouse movement - always trigger redraw for corner knob updates
+                self.state.need_redraw = True
+                
+        elif event == cv2.EVENT_LBUTTONDOWN:
+            if self.state.relocation_mode:
+                # Handle relocation clicks
+                self.state.relocation_clicks.append((x, y))
+                print(f"Click {len(self.state.relocation_clicks)}: ({x}, {y})")
+                
+                if len(self.state.relocation_clicks) == 2:
+                    print("Two clicks recorded. Applying new coordinates...")
+                    if self.current_original_img is not None:
+                        self.controller.apply_relocation(self.state, self.current_original_img)
+                    else:
+                        print("Error: No image available for relocation")
+                        self.state.reset_relocation_mode()
+                
+                self.state.need_redraw = True
+            elif not self.state.corner_dragging_mode:
+                # Try to start corner dragging if mouse is within a corner knob (same as 'd' key)
+                if hasattr(self, '_last_closest_corner_info') and self._last_closest_corner_info is not None:
+                    corner_x, corner_y, detection_id = self._last_closest_corner_info
+                    # Check if mouse is actually within the corner knob radius
+                    distance = ((x - corner_x) ** 2 + (y - corner_y) ** 2) ** 0.5
+                    if distance <= CORNER_KNOB_RADIUS:
+                        success = self.controller.start_corner_dragging(self.state, self._last_closest_corner_info)
+                        if success:
+                            print(f"Started dragging {self.state.dragged_corner_type} corner of detection {detection_id}")
+                            print("Click again or press 'd' to finish dragging, or ESC to cancel")
+                            self.state.need_redraw = True
+                        else:
+                            print("Failed to start corner dragging")
+                    else:
+                        print(f"Mouse must be within the corner knob (white circle) to start dragging")
+                # If no corner is available, do nothing (no error message for cleaner UX)
+            else:
+                # Finish corner dragging (same as 'd' key)
+                print("Finishing corner drag")
+                success = self.controller.finish_corner_dragging(self.state)
+                if success:
+                    self.state.need_redraw = True
 
     def handle_key_press(self, key: int, original_img, image_id: int = None) -> Optional[int]:
         """Handle key press events. Returns navigation command or None"""
         # print(f"Key pressed: {key}")
         
-        if key == 27 or key == 113:  # ESC key or q
+        # Handle escape key specially to cancel corner dragging
+        if key == 27:  # ESC key
+            if self.state.corner_dragging_mode:
+                print("Cancelled corner dragging - returning to original position")
+                self.state.reset_corner_dragging_mode()
+                self.state.need_redraw = True
+                return None
+            else:
+                return 0  # Exit
+        
+        # Prevent most actions during corner dragging
+        if self.state.corner_dragging_mode:
+            if key == 113:  # 'q' key - allow exit
+                return 0
+            elif key == 100:  # 'd' key - allow finishing drag
+                pass  # Will be handled below
+            else:
+                print("Corner dragging in progress. Press 'd' or click to finish, or ESC to cancel.")
+                return None
+        
+        if key == 113:  # q
             return 0  # Exit
         elif key == 32 or key == 3:  # SPACE or right arrow
             return 1  # Next image
@@ -796,6 +1123,32 @@ class UserInterface:
                 self.state.need_redraw = True
         elif key == 99:  # 'c' key for relocation mode
             self.controller.handle_relocation_mode(self.state)
+        elif key == 100:  # 'd' key for corner dragging mode
+            if not self.state.corner_dragging_mode:
+                # Try to start corner dragging if mouse is within a corner knob
+                if hasattr(self, '_last_closest_corner_info') and self._last_closest_corner_info is not None:
+                    corner_x, corner_y, detection_id = self._last_closest_corner_info
+                    # Check if mouse is actually within the corner knob radius (not just proximity threshold)
+                    distance = ((self.state.mouse_x - corner_x) ** 2 + (self.state.mouse_y - corner_y) ** 2) ** 0.5
+                    if distance <= CORNER_KNOB_RADIUS:
+                        success = self.controller.start_corner_dragging(self.state, self._last_closest_corner_info)
+                        if success:
+                            print(f"Started dragging {self.state.dragged_corner_type} corner of detection {detection_id}")
+                            print("Press 'd' again or click to finish dragging, or ESC to cancel")
+                            self.state.need_redraw = True
+                        else:
+                            print("Failed to start corner dragging")
+                    else:
+                        print(f"Mouse must be within the corner knob (white/grey circle) to start dragging")
+                        print(f"Current distance: {distance:.1f} pixels, required: ≤{CORNER_KNOB_RADIUS} pixels")
+                else:
+                    print("No corner highlighted. Move mouse near a corner first, then press 'd' or click")
+            else:
+                # Finish corner dragging
+                print("Finishing corner drag")
+                success = self.controller.finish_corner_dragging(self.state)
+                if success:
+                    self.state.need_redraw = True
         elif key == 9:  # TAB key for cycling through overlapping detections
             self.controller.cycle_overlapping_detections(self.state)
         elif key in CATEGORY_KEYS:  # Category change keys (p, o, etc.)
@@ -821,6 +1174,10 @@ class UserInterface:
         if self.state.relocation_mode:
             print("Exiting relocation mode due to image change")
             self.state.reset_relocation_mode()
+        
+        if self.state.corner_dragging_mode:
+            print("Exiting corner dragging mode due to image change")
+            self.state.reset_corner_dragging_mode()
         
         self.state.reset_overlapping_detections()
         
@@ -859,19 +1216,30 @@ class UserInterface:
         print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
               f"z = delete all detections, h = toggle hard flag, p = mark as possum, o = mark as other, g = mark as ganggang, "
               f"P = mark ALL as possum, O = mark ALL as other, G = mark ALL as ganggang, v = mark ALL as other (quick), "
-              f"c = relocate detection, Shift+K = add autodelete template, Shift+R = clear all templates, TAB = cycle overlapping detections, ESC = exit")
+              f"c = relocate detection, CLICK or d = drag corner (inside white knob), Shift+K = add autodelete template, "
+              f"Shift+R = clear all templates, TAB = cycle overlapping detections, ESC = exit")
         
         # Save position
         db_manager.save_last_image_index(current_index)
+        
+        # Initialize detections
+        detections = db_manager.get_detections_for_image(image_id, confidence_threshold)
         
         self.state.need_redraw = True
         
         # Main event loop
         while True:
             if self.state.need_redraw:
-                # Refresh detections and redraw
-                detections = db_manager.get_detections_for_image(image_id, confidence_threshold)
+                # Refresh detections and redraw - but NOT during corner dragging
+                if not self.state.corner_dragging_mode:
+                    detections = db_manager.get_detections_for_image(image_id, confidence_threshold)
+                # During corner dragging, keep using the existing detections with modified coordinates
                 updated_img = self.renderer.draw_boxes_on_image(original_img, detections, self.state, db_manager)
+                
+                # Store the closest corner info for click detection
+                # Use the current_boxes that were just calculated in draw_boxes_on_image
+                closest_corner_info = self.renderer.find_closest_corner(self.state.current_boxes, self.state.mouse_x, self.state.mouse_y)
+                self._last_closest_corner_info = closest_corner_info
                 
                 # Add filename text
                 text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
@@ -884,7 +1252,8 @@ class UserInterface:
                 self.state.need_redraw = False
             
             # Handle key press
-            key = cv2.waitKey(50) & 0xFF
+            wait_time = 30 if self.state.corner_dragging_mode else 50  # Optimized for keyboard-based dragging
+            key = cv2.waitKey(wait_time) & 0xFF
             if key == 255:
                 continue
             
