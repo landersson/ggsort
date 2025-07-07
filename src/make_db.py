@@ -15,6 +15,8 @@ def parse_args():
                         help='Filter images by first component of the file path')
     parser.add_argument('--image-dir', default='images',
                         help='Directory containing wildlife images (default: images)')
+    parser.add_argument('--results-file', default='data/results.json',
+                        help='Input JSON file containing detection results (default: data/results.json)')
     parser.add_argument('--output',
                         help='Output SQLite database file (default: {base-dir}.db)')
     parser.add_argument('--conf-threshold', type=float, default=0.0,
@@ -86,6 +88,7 @@ def main():
     args = parse_args()
     base_dir = args.base_dir
     image_dir = args.image_dir
+    results_file = args.results_file
     conf_threshold = args.conf_threshold
     
     # Parse include categories
@@ -101,6 +104,7 @@ def main():
     else:
         db_path = f"{base_dir}.db"
     
+    print(f"Using results file: {results_file}")
     print(f"Using image directory: {image_dir}")
     print(f"Using confidence threshold: {conf_threshold}")
     print(f"Including categories: {include_categories}")
@@ -108,13 +112,13 @@ def main():
     
     # Load JSON data
     try:
-        with open('data/results.json', 'r') as f:
+        with open(results_file, 'r') as f:
             data = json.load(f)
     except FileNotFoundError:
-        print("Error: data/results.json file not found")
+        print(f"Error: {results_file} file not found")
         return 1
     except json.JSONDecodeError:
-        print("Error: Invalid JSON format in results.json")
+        print(f"Error: Invalid JSON format in {results_file}")
         return 1
     
     # Get all images
