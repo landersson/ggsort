@@ -22,7 +22,7 @@ COLORS = {
     '1': (0, 0, 255),    # Red for GangGangs
     '2': (255, 0, 0),    # Blue for persons
     '3': (0, 255, 0),     # Green for vehicles
-    '4': (0, 255, 255),   # Yellow for possums
+    '4': (66,200,94),   # Yellow for possums
     '5': (255, 255, 0)    # Purple for other
 }
 
