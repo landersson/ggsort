@@ -304,6 +304,7 @@ class TestUserInterface(unittest.TestCase):
         mock_db_manager.get_detections_for_image.return_value = [
             Detection(id=1, category=1, confidence=0.95, x=0.1, y=0.2, width=0.3, height=0.4)
         ]
+        mock_db_manager.auto_delete_similar_detections.return_value = 0
         
         # Mock renderer
         self.mock_renderer.draw_boxes_on_image.return_value = self.test_image
@@ -388,6 +389,7 @@ class TestUserInterface(unittest.TestCase):
         mock_db_manager.get_detections_for_image.return_value = [
             Detection(id=1, category=1, confidence=0.95, x=0.1, y=0.2, width=0.3, height=0.4)
         ]
+        mock_db_manager.auto_delete_similar_detections.return_value = 0
         
         self.mock_renderer.draw_boxes_on_image.return_value = self.test_image
         
@@ -429,6 +431,7 @@ class TestUserInterface(unittest.TestCase):
         mock_db_manager = MagicMock()
         test_detection = Detection(id=1, category=1, confidence=0.95, x=0.1, y=0.2, width=0.3, height=0.4)
         mock_db_manager.get_detections_for_image.return_value = [test_detection]
+        mock_db_manager.auto_delete_similar_detections.return_value = 0
         
         self.mock_renderer.draw_boxes_on_image.return_value = self.test_image
         
