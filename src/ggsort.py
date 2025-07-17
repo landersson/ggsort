@@ -1213,11 +1213,11 @@ class UserInterface:
         display_text = f"{current_index+1} / {total_images} : {basename}"
         
         print(f"Showing {image_path} with {len(detections)} detection(s)")
-        print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
-              f"z = delete all detections, h = toggle hard flag, p = mark as possum, o = mark as other, g = mark as ganggang, "
-              f"P = mark ALL as possum, O = mark ALL as other, G = mark ALL as ganggang, v = mark ALL as other (quick), "
-              f"c = relocate detection, CLICK or d = drag corner (inside white knob), Shift+K = add autodelete template, "
-              f"Shift+R = clear all templates, TAB = cycle overlapping detections, ESC = exit")
+        # print(f"Controls: SPACE/RIGHT ARROW = next, LEFT ARROW = previous, BACKSPACE/x = toggle delete, "
+        #       f"z = delete all detections, h = toggle hard flag, p = mark as possum, o = mark as other, g = mark as ganggang, "
+        #       f"P = mark ALL as possum, O = mark ALL as other, G = mark ALL as ganggang, v = mark ALL as other (quick), "
+        #       f"c = relocate detection, CLICK or d = drag corner (inside white knob), Shift+K = add autodelete template, "
+        #       f"Shift+R = clear all templates, TAB = cycle overlapping detections, ESC = exit")
         
         # Save position
         db_manager.save_last_image_index(current_index)
@@ -1334,8 +1334,9 @@ class GGSortApplication:
                     new_i = i + 1
                     if new_i >= total_images:
                         print(f"Already at last image ({i + 1}/{total_images})")
-                        # Stay at current image instead of exiting
-                        continue
+                        # If we can't read the last image, exit cleanly to avoid infinite loop
+                        print("Cannot read the last image file. Exiting...")
+                        break
                     i = new_i
                 elif result == -1:
                     # Move to previous image, but clamp to first image
