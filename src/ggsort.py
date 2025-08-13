@@ -1083,6 +1083,10 @@ class UserInterface:
             return 1  # Next image
         elif key == 2:  # LEFT ARROW key
             return -1  # Previous image
+        elif key == 102:  # 'f' key for fast forward (10 images)
+            return 10  # Jump 10 images forward
+        elif key == 98:  # 'b' key for fast backward (10 images)
+            return -10  # Jump 10 images backward
         elif key == 8 or key == 127 or key == 120:  # BACKSPACE or 'x' key
             if self.state.selected_detection_id is not None:
                 success = self.controller.db_manager.toggle_detection_deleted_status(self.state.selected_detection_id)
@@ -1265,6 +1269,10 @@ class UserInterface:
                     db_manager.save_last_image_index(current_index + 1)
                 elif result == -1:
                     db_manager.save_last_image_index(max(0, current_index - 1))
+                elif result == 10:
+                    db_manager.save_last_image_index(min(current_index + 10, len(db_manager.get_images_from_database()) - 1))
+                elif result == -10:
+                    db_manager.save_last_image_index(max(0, current_index - 10))
                 return result
 
 class GGSortApplication:
@@ -1345,6 +1353,22 @@ class GGSortApplication:
                         print(f"Already at first image ({i + 1}/{total_images})")
                         # Stay at current image instead of exiting
                         continue
+                    i = new_i
+                elif result == 10:
+                    # Jump forward 10 images, but clamp to last image
+                    new_i = min(i + 10, total_images - 1)
+                    if new_i == i:
+                        print(f"Already at or near last image ({i + 1}/{total_images})")
+                        continue
+                    print(f"Jumping forward 10 images to {new_i + 1}/{total_images}")
+                    i = new_i
+                elif result == -10:
+                    # Jump backward 10 images, but clamp to first image
+                    new_i = max(i - 10, 0)
+                    if new_i == i:
+                        print(f"Already at or near first image ({i + 1}/{total_images})")
+                        continue
+                    print(f"Jumping backward 10 images to {new_i + 1}/{total_images}")
                     i = new_i
             
             return 0
