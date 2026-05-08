@@ -1166,10 +1166,12 @@ class UserInterface:
         controller: DetectionController,
         renderer: DetectionRenderer,
         state: AppState,
+        skip_empty_images: bool = False,
     ):
         self.controller = controller
         self.renderer = renderer
         self.state = state
+        self.skip_empty_images = skip_empty_images
         self.window_name = 'GGSort'
         self.current_original_img = None  # Store current image for relocation
 
@@ -1283,6 +1285,12 @@ class UserInterface:
                 success = self.controller.mark_all_detections_deleted(image_id)
                 if success:
                     self.state.need_redraw = True
+            else:
+                print('Error: No image ID available for marking detections as deleted')
+        elif key == 90:  # 'Z' key (Shift+z) for marking all as deleted and advancing
+            if image_id is not None:
+                self.controller.mark_all_detections_deleted(image_id)
+                return 1
             else:
                 print('Error: No image ID available for marking detections as deleted')
         elif key == 104:  # 'h' key for toggling hard flag
@@ -1405,6 +1413,9 @@ class UserInterface:
             print(f'Auto-deleted {auto_deleted_count} detection(s) matching autodelete templates')
             # Refresh detections after auto-deletion
             detections = db_manager.get_detections_for_image(image_id, confidence_threshold)
+            if self.skip_empty_images and all(d.deleted for d in detections):
+                print(f'Skipping {image_path} - all detections deleted after auto-delete')
+                return 1
 
         # Display info
         basename = os.path.basename(image_path)
@@ -1504,7 +1515,7 @@ class GGSortApplication:
         self.renderer = DetectionRenderer(self.categories)
         self.state = AppState()
         self.controller = DetectionController(self.db_manager, self.renderer)
-        self.ui = UserInterface(self.controller, self.renderer, self.state)
+        self.ui = UserInterface(self.controller, self.renderer, self.state, skip_empty_images=skip_empty_images)
 
         self.image_dir = image_dir
         self.confidence_threshold = confidence_threshold

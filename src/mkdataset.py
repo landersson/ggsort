@@ -180,7 +180,7 @@ def sample_images_by_category(cursor, location_stats, category, target_total, ca
     
     return selected_images
 
-def export_images(db_file: str, images_dir: str, output_dir: str, max_images: int = None, target_gang_gang: int = None, target_possum: int = None, include_locations: str = None, exclude_locations: str = None):
+def export_images(db_file: str, images_dir: str, output_dir: str, max_images: int = None, target_gang_gang: int = None, target_possum: int = None, target_other: int = None, include_locations: str = None, exclude_locations: str = None):
     """Export images from database to output directory with subdirectory organization"""
     
     # Connect to database
@@ -241,20 +241,24 @@ def export_images(db_file: str, images_dir: str, output_dir: str, max_images: in
         
         gang_gang_stats = get_detection_stats_by_category(1)
         possum_stats = get_detection_stats_by_category(4)
-        
+        other_stats = get_detection_stats_by_category(5)
+
         # Print location statistics
         print("\nImage count by location:")
         print("-" * 60)
         for location, count in sorted(location_stats.items()):
             gang_gang_count = gang_gang_stats.get(location, 0)
             possum_count = possum_stats.get(location, 0)
-            print(f"{location}: {count} images, {gang_gang_count} Gang Gang detections, {possum_count} Possum detections")
-        
+            other_count = other_stats.get(location, 0)
+            print(f"{location}: {count} images, {gang_gang_count} Gang Gang detections, {possum_count} Possum detections, {other_count} Other detections")
+
         print(f"\nTotal locations: {len(location_stats)}")
         total_gang_gangs = sum(gang_gang_stats.values())
         total_possums = sum(possum_stats.values())
+        total_others = sum(other_stats.values())
         print(f"Total Gang Gang detections: {total_gang_gangs}")
         print(f"Total Possum detections: {total_possums}")
+        print(f"Total Other detections: {total_others}")
         
         # Apply location filtering
         filtered_location_stats = location_stats.copy()
@@ -282,7 +286,8 @@ def export_images(db_file: str, images_dir: str, output_dir: str, max_images: in
                 image_count = filtered_location_stats[location]
                 gang_gang_count = gang_gang_stats.get(location, 0)
                 possum_count = possum_stats.get(location, 0)
-                print(f"{location}: {image_count} images, {gang_gang_count} Gang Gang detections, {possum_count} Possum detections")
+                other_count = other_stats.get(location, 0)
+                print(f"{location}: {image_count} images, {gang_gang_count} Gang Gang detections, {possum_count} Possum detections, {other_count} Other detections")
         
         # Use filtered locations for sampling
         location_stats = filtered_location_stats
@@ -299,7 +304,12 @@ def export_images(db_file: str, images_dir: str, output_dir: str, max_images: in
         if target_possum:
             possum_images = sample_images_by_category(cursor, location_stats, 4, target_possum, "Possum")
             all_selected_images.extend(possum_images)
-        
+
+        # Other sampling
+        if target_other:
+            other_images = sample_images_by_category(cursor, location_stats, 5, target_other, "Other")
+            all_selected_images.extend(other_images)
+
         # Remove duplicates based on file_path (some images may have both categories)
         if all_selected_images:
             seen_paths = set()
@@ -430,6 +440,8 @@ def main():
                         help='Target number of Gang Gang images to export, distributed evenly across locations')
     parser.add_argument('--target-possum', type=int,
                         help='Target number of Possum images to export, distributed evenly across locations')
+    parser.add_argument('--target-other', type=int,
+                        help='Target number of Other images to export, distributed evenly across locations')
     parser.add_argument('--include-locations', type=str,
                         help='Comma-separated list of locations to include (only these locations will be considered)')
     parser.add_argument('--exclude-locations', type=str,
@@ -456,7 +468,7 @@ def main():
     if args.max_images:
         print(f"Maximum images: {args.max_images}")
     
-    return export_images(args.db_file, args.images_dir, args.output_dir, args.max_images, args.target_gang_gang, args.target_possum, args.include_locations, args.exclude_locations)
+    return export_images(args.db_file, args.images_dir, args.output_dir, args.max_images, args.target_gang_gang, args.target_possum, args.target_other, args.include_locations, args.exclude_locations)
 
 if __name__ == "__main__":
     sys.exit(main())

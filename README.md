@@ -16,7 +16,6 @@ pip install -r requirements.txt
 ./bin/ggsort Waynes
 ```
 
-## Interactive Controls
 
 ### Navigation
 - **SPACE** or **RIGHT ARROW**: Next image
