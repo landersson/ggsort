@@ -568,13 +568,144 @@ def _sample_location_diversity(
 
 
 # ---------------------------------------------------------------------------
+# DB output (matches src/make_db.py schema so ggsort can open the result for QA)
+# ---------------------------------------------------------------------------
+
+def _write_output_db(
+    cursor_src,
+    all_selected_images: list[ImageRecord],
+    output_path: str,
+    images_dir: str,
+    confidence_threshold: float,
+) -> None:
+    """Write the sampled selection to a new SQLite DB matching make_db.py's schema.
+
+    Writes only post-filter detections (deleted=0, hard=0, subcategory=NULL); original
+    confidence is preserved. file_path is stored relative to images_dir so ggsort can
+    resolve images via its own --image-dir at QA time. The schema below intentionally
+    duplicates src/make_db.py:38-66 — keep them in sync if the canonical schema changes.
+    """
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    parent = os.path.dirname(output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    conn = sqlite3.connect(output_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # Schema mirrors src/make_db.py:39-70.
+    cursor.execute("""
+        CREATE TABLE images (
+            id INTEGER PRIMARY KEY,
+            file_path TEXT UNIQUE NOT NULL,
+            width INTEGER,
+            height INTEGER,
+            datetime_original TEXT,
+            manually_processed BOOLEAN DEFAULT 0
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE detections (
+            id INTEGER PRIMARY KEY,
+            image_id INTEGER NOT NULL,
+            category INTEGER,
+            confidence REAL,
+            x REAL,
+            y REAL,
+            width REAL,
+            height REAL,
+            deleted BOOLEAN DEFAULT 0,
+            subcategory INTEGER,
+            hard BOOLEAN DEFAULT 0,
+            FOREIGN KEY (image_id) REFERENCES images(id)
+        )
+    """)
+    cursor.execute("CREATE INDEX idx_image_id ON detections(image_id)")
+    cursor.execute("CREATE INDEX idx_file_path ON images(file_path)")
+
+    # Bulk-fetch image dimensions once instead of querying per-image. SQLite handles a
+    # few thousand parameters in IN(...) without issue.
+    src_ids = [img.id for img in all_selected_images]
+    dims: dict[int, tuple[int | None, int | None]] = {}
+    if src_ids:
+        # Chunk to stay safely under SQLite's variable cap (default 999) for very large samples.
+        CHUNK = 900
+        for start in range(0, len(src_ids), CHUNK):
+            chunk = src_ids[start:start + CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            cursor_src.execute(
+                f"SELECT id, width, height FROM images WHERE id IN ({placeholders})",
+                chunk,
+            )
+            for row in cursor_src.fetchall():
+                dims[row['id']] = (row['width'], row['height'])
+
+    abs_path_warned = False
+    n_images = 0
+    n_detections = 0
+
+    cursor.execute("BEGIN TRANSACTION")
+    for img in all_selected_images:
+        # Resolve to a path relative to images_dir for ggsort compatibility.
+        rel_path = img.file_path
+        if os.path.isabs(rel_path):
+            try:
+                rel_path = os.path.relpath(rel_path, images_dir)
+            except ValueError:
+                # Cross-drive on Windows; keep absolute and warn (once).
+                if not abs_path_warned:
+                    print(f"Warning: keeping absolute path {img.file_path!r} (relpath failed)")
+                    abs_path_warned = True
+
+        width, height = dims.get(img.id, (None, None))
+        cursor.execute(
+            "INSERT INTO images (file_path, width, height, datetime_original, manually_processed) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (rel_path, width, height, img.datetime_original),
+        )
+        new_image_id = cursor.lastrowid
+
+        # Same canonical filter the rest of mkdataset uses; SELECT confidence too so we
+        # can preserve it (the existing per-image fetch in export_images doesn't, since
+        # metadata.json never wrote it).
+        cursor_src.execute(
+            """
+            SELECT category, confidence, x, y, width, height
+            FROM detections
+            WHERE image_id = ? AND deleted = 0
+              AND (hard = 0 OR hard IS NULL)
+              AND confidence >= ?
+            ORDER BY confidence DESC
+            """,
+            (img.id, confidence_threshold),
+        )
+        for det in cursor_src.fetchall():
+            cursor.execute(
+                "INSERT INTO detections "
+                "(image_id, category, confidence, x, y, width, height, deleted, subcategory, hard) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, 0)",
+                (new_image_id, det['category'], det['confidence'],
+                 det['x'], det['y'], det['width'], det['height']),
+            )
+            n_detections += 1
+        n_images += 1
+
+    conn.commit()
+    conn.close()
+    print(f"Wrote {n_images} images with {n_detections} detections to {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Top-level export
 # ---------------------------------------------------------------------------
 
 def export_images(
     db_file: str,
     images_dir: str,
-    output_dir: str,
+    output_dir: str | None = None,
     max_images: int | None = None,
     target_gang_gang: int | None = None,
     target_possum: int | None = None,
@@ -584,8 +715,10 @@ def export_images(
     diversity_config: DiversityConfig | None = None,
     skip_export: bool = False,
     confidence_threshold: float = 0.20,
+    save_as_db_path: str | None = None,
 ):
-    """Export images from database to output directory with subdirectory organization"""
+    """Export images from database. Writes metadata.json + image copies under output_dir
+    by default; with save_as_db_path also/instead writes a SQLite DB at that path."""
 
     if diversity_config is None:
         diversity_config = DiversityConfig()
@@ -750,6 +883,15 @@ def export_images(
                 print(f"\nRemoved {duplicates_removed} duplicate images (images selected by multiple categories)")
                 print(f"Final unique image count: {len(all_selected_images)}")
 
+        # Save the selection as a SQLite DB for QA in ggsort. Independent of output_dir;
+        # both can run in the same invocation if the user wants both formats.
+        if save_as_db_path and all_selected_images:
+            if diversity_config.enabled:
+                print("\nNote: --save-as-db does not persist diversity diagnostics "
+                      "(sequence_id/length/novelty). Re-run with --skip-export to capture them in metadata.json.")
+            _write_output_db(cursor, all_selected_images, save_as_db_path,
+                             images_dir, confidence_threshold)
+
         # Export all selected images if output directory is specified
         if output_dir and all_selected_images:
             os.makedirs(output_dir, exist_ok=True)
@@ -870,8 +1012,9 @@ def main():
     parser.add_argument('--db-file', required=True, help='SQLite database file')
     parser.add_argument('--images-dir', required=True,
                         help='Base directory containing input image files')
-    parser.add_argument('--output-dir', required=True,
-                        help='Output directory for exported images')
+    parser.add_argument('--output-dir', default=None,
+                        help='Output directory for exported images and metadata.json. '
+                             'Optional if --save-as-db is given.')
     parser.add_argument('--max-images', type=int,
                         help='Maximum number of images to export')
     parser.add_argument('--target-gang-gang', type=int,
@@ -900,12 +1043,21 @@ def main():
                         help='Skip copying image files; write metadata.json only')
     parser.add_argument('--confidence-threshold', type=float, default=0.20,
                         help='Minimum detection confidence to consider (default 0.20)')
+    parser.add_argument('--save-as-db', type=str, default=None,
+                        help='Write the sampled selection to a SQLite DB at this path '
+                             '(matching make_db.py schema). No image files are copied. '
+                             'Pair with the same --images-dir at QA time so ggsort can resolve paths.')
 
     args = parser.parse_args()
 
     if not (0.0 <= args.confidence_threshold <= 1.0):
         print(f"Error: --confidence-threshold must be in [0.0, 1.0], got {args.confidence_threshold}")
         return 1
+
+    if not args.output_dir and not args.save_as_db:
+        # No output destination — only useful for stats-only runs. Warn but don't abort.
+        print("Note: neither --output-dir nor --save-as-db was given; "
+              "the run will only print statistics and not write any output.")
 
     # Validate arguments
     if not os.path.exists(args.db_file):
@@ -930,7 +1082,10 @@ def main():
 
     print(f"Exporting from database: {args.db_file}")
     print(f"Input images directory: {args.images_dir}")
-    print(f"Output directory: {args.output_dir}")
+    if args.output_dir:
+        print(f"Output directory: {args.output_dir}")
+    if args.save_as_db:
+        print(f"Save as DB: {args.save_as_db}")
     if args.max_images:
         print(f"Maximum images: {args.max_images}")
     if args.skip_export:
@@ -949,6 +1104,7 @@ def main():
         diversity_config=diversity_config,
         skip_export=args.skip_export,
         confidence_threshold=args.confidence_threshold,
+        save_as_db_path=args.save_as_db,
     )
 
 

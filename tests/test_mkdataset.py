@@ -414,5 +414,181 @@ class TestEndToEnd(unittest.TestCase):
         self.assertNotEqual(a_paths, b_paths)
 
 
+# ---------------------------------------------------------------------------
+# --save-as-db: write the sample to a fresh SQLite DB matching make_db.py schema
+# ---------------------------------------------------------------------------
+
+from mkdataset import _write_output_db
+
+
+class TestSaveAsDb(unittest.TestCase):
+    """Verify the new DB output mode produces a valid, ggsort-compatible database."""
+
+    def setUp(self):
+        self.conn = _make_db()
+        # A small mix: one short burst + a couple of isolated frames + one image with
+        # both gang_gang AND possum detections (exercises multi-class dedup) + one image
+        # with a hard detection that should be filtered out of the output.
+        t0 = datetime(2024, 5, 1, 9, 0, 0)
+        for i in range(6):
+            _insert_image(self.conn, img_id=100 + i,
+                          file_path=f"locA/burst_{i:02d}.jpg",
+                          dt_str=_ts(t0 + timedelta(seconds=i * 5)),
+                          boxes=[(0.4, 0.4, 0.2, 0.2)])
+        _insert_image(self.conn, img_id=200,
+                      file_path="locA/iso_00.jpg",
+                      dt_str=_ts(t0 + timedelta(hours=4)),
+                      boxes=[(0.1, 0.1, 0.15, 0.15)])
+        _insert_image(self.conn, img_id=201,
+                      file_path="locA/iso_01.jpg",
+                      dt_str=_ts(t0 + timedelta(hours=8)),
+                      boxes=[(0.7, 0.7, 0.1, 0.1)])
+        # Image with a hard detection — should never make it into the output DB.
+        c = self.conn.cursor()
+        c.execute("INSERT INTO images (id, file_path, datetime_original, width, height) "
+                  "VALUES (300, 'locA/hard_only.jpg', ?, 1920, 1080)", (_ts(t0 + timedelta(hours=12)),))
+        c.execute("INSERT INTO detections (image_id, category, confidence, x, y, width, height, deleted, hard) "
+                  "VALUES (300, 1, 0.9, 0.3, 0.3, 0.1, 0.1, 0, 1)")
+        self.tmpfile = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.tmpfile.close()
+        self.out_path = self.tmpfile.name
+        os.unlink(self.out_path)  # _write_output_db will create it fresh
+
+    def tearDown(self):
+        self.conn.close()
+        if os.path.exists(self.out_path):
+            os.unlink(self.out_path)
+
+    def _sample_and_write(self, target=10):
+        cursor = self.conn.cursor()
+        location_stats = {"locA": 9}
+        records = sample_images_by_category(cursor, location_stats, 1, target, "Gang Gang", None)
+        _write_output_db(cursor, records, self.out_path,
+                         images_dir="/some/base", confidence_threshold=0.20)
+        return records
+
+    def test_writes_valid_schema(self):
+        self._sample_and_write(target=10)
+        self.assertTrue(os.path.exists(self.out_path))
+
+        out = sqlite3.connect(self.out_path)
+        out.row_factory = sqlite3.Row
+        c = out.cursor()
+
+        # Check the four expected sqlite_master entries are present.
+        c.execute("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index') ORDER BY name")
+        names = {row['name'] for row in c.fetchall()}
+        self.assertIn('images', names)
+        self.assertIn('detections', names)
+        self.assertIn('idx_image_id', names)
+        self.assertIn('idx_file_path', names)
+
+        # Column lists match the canonical schema (order doesn't matter).
+        c.execute("PRAGMA table_info(images)")
+        img_cols = {row['name'] for row in c.fetchall()}
+        self.assertEqual(img_cols, {'id', 'file_path', 'width', 'height',
+                                    'datetime_original', 'manually_processed'})
+        c.execute("PRAGMA table_info(detections)")
+        det_cols = {row['name'] for row in c.fetchall()}
+        self.assertEqual(det_cols, {'id', 'image_id', 'category', 'confidence',
+                                    'x', 'y', 'width', 'height', 'deleted',
+                                    'subcategory', 'hard'})
+        out.close()
+
+    def test_invariants_on_written_rows(self):
+        self._sample_and_write(target=10)
+        out = sqlite3.connect(self.out_path)
+        out.row_factory = sqlite3.Row
+        c = out.cursor()
+
+        # Every detection row has hard=0, deleted=0, subcategory=NULL — matches the canonical
+        # filter mkdataset applies. The hard-only image (id=300) must be absent from the
+        # output entirely (it had no surviving detections, so it shouldn't have been picked).
+        c.execute("SELECT COUNT(*) FROM detections WHERE hard != 0 OR deleted != 0 OR subcategory IS NOT NULL")
+        self.assertEqual(c.fetchone()[0], 0)
+
+        c.execute("SELECT COUNT(*) FROM images WHERE file_path = 'locA/hard_only.jpg'")
+        self.assertEqual(c.fetchone()[0], 0,
+                         "image with only hard detections should not appear in output")
+
+        # All file_paths are relative (no absolute paths leaking through).
+        c.execute("SELECT file_path FROM images")
+        for row in c.fetchall():
+            self.assertFalse(os.path.isabs(row['file_path']),
+                             f"unexpected absolute path: {row['file_path']!r}")
+
+        # datetime_original carries through.
+        c.execute("SELECT datetime_original FROM images WHERE file_path = 'locA/burst_00.jpg'")
+        row = c.fetchone()
+        self.assertIsNotNone(row)
+        self.assertTrue(row['datetime_original'].startswith('2024:05:01'))
+
+        # FK integrity: every detections.image_id must exist in images.id.
+        c.execute("""
+            SELECT COUNT(*) FROM detections d
+            LEFT JOIN images i ON i.id = d.image_id
+            WHERE i.id IS NULL
+        """)
+        self.assertEqual(c.fetchone()[0], 0)
+
+        # confidence preserved (we used 0.9 in the fixture).
+        c.execute("SELECT MIN(confidence), MAX(confidence) FROM detections")
+        lo, hi = c.fetchone()
+        self.assertAlmostEqual(lo, 0.9)
+        self.assertAlmostEqual(hi, 0.9)
+
+        out.close()
+
+    def test_no_duplicate_image_rows_for_multi_class(self):
+        """Mark one image as also a possum detection; sampling both classes should yield
+        one row in the output's images table, not two (UNIQUE(file_path) holds)."""
+        # Add a possum detection to burst_00.
+        c = self.conn.cursor()
+        c.execute("INSERT INTO detections (image_id, category, confidence, x, y, width, height, deleted, hard) "
+                  "VALUES (100, 4, 0.9, 0.5, 0.5, 0.1, 0.1, 0, 0)")
+
+        cursor = self.conn.cursor()
+        location_stats = {"locA": 9}
+        gg = sample_images_by_category(cursor, location_stats, 1, 5, "Gang Gang", None)
+        possum = sample_images_by_category(cursor, location_stats, 4, 5, "Possum", None)
+        combined = list(gg) + list(possum)
+
+        # Mimic the dedup logic in export_images.
+        seen: dict[str, ImageRecord] = {}
+        unique = []
+        for r in combined:
+            if r.file_path not in seen:
+                seen[r.file_path] = r
+                unique.append(r)
+        # burst_00 was selected for both classes — must still appear exactly once in output.
+        self.assertLessEqual(len(unique), len(combined))
+
+        _write_output_db(cursor, unique, self.out_path,
+                         images_dir="/some/base", confidence_threshold=0.20)
+
+        out = sqlite3.connect(self.out_path)
+        c = out.cursor()
+        c.execute("SELECT COUNT(*) FROM images WHERE file_path = 'locA/burst_00.jpg'")
+        self.assertEqual(c.fetchone()[0], 1)
+        # The possum detection should be present alongside the gang_gang one.
+        c.execute("SELECT category FROM detections d JOIN images i ON i.id = d.image_id "
+                  "WHERE i.file_path = 'locA/burst_00.jpg' ORDER BY category")
+        cats = [row[0] for row in c.fetchall()]
+        self.assertEqual(cats, [1, 4])
+        out.close()
+
+    def test_relative_path_passthrough(self):
+        self._sample_and_write(target=3)
+        out = sqlite3.connect(self.out_path)
+        c = out.cursor()
+        c.execute("SELECT file_path FROM images")
+        paths = sorted(row[0] for row in c.fetchall())
+        # Source paths were already relative, so they should survive verbatim — no
+        # accidental joining with images_dir.
+        for p in paths:
+            self.assertTrue(p.startswith("locA/"), f"unexpected path: {p!r}")
+        out.close()
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
