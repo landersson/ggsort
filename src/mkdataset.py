@@ -240,7 +240,9 @@ def _sample_within_sequence(
 # Per-location image fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_location_records_legacy(cursor, category: int, location: str) -> list[ImageRecord]:
+def _fetch_location_records_legacy(
+    cursor, category: int, location: str, confidence_threshold: float
+) -> list[ImageRecord]:
     """Legacy stride path: minimal fields, alphabetical file_path order. No bbox/datetime data."""
     cursor.execute(
         """
@@ -249,11 +251,11 @@ def _fetch_location_records_legacy(cursor, category: int, location: str) -> list
         JOIN detections d ON i.id = d.image_id
         WHERE d.category = ? AND d.deleted = 0
           AND (d.hard = 0 OR d.hard IS NULL)
-          AND d.confidence >= 0.20
+          AND d.confidence >= ?
           AND i.file_path LIKE ?
         ORDER BY i.file_path
         """,
-        (category, f"{location}%"),
+        (category, confidence_threshold, f"{location}%"),
     )
     return [
         ImageRecord(id=row['id'], file_path=row['file_path'], datetime_original=row['datetime_original'])
@@ -261,7 +263,9 @@ def _fetch_location_records_legacy(cursor, category: int, location: str) -> list
     ]
 
 
-def _fetch_location_records_diversity(cursor, category: int, location: str) -> list[ImageRecord]:
+def _fetch_location_records_diversity(
+    cursor, category: int, location: str, confidence_threshold: float
+) -> list[ImageRecord]:
     """Diversity path: join with detections to bring back per-image bbox lists, sort chronologically."""
     cursor.execute(
         """
@@ -271,11 +275,11 @@ def _fetch_location_records_diversity(cursor, category: int, location: str) -> l
         JOIN detections d ON i.id = d.image_id
         WHERE d.category = ? AND d.deleted = 0
           AND (d.hard = 0 OR d.hard IS NULL)
-          AND d.confidence >= 0.20
+          AND d.confidence >= ?
           AND i.file_path LIKE ?
         ORDER BY i.file_path
         """,
-        (category, f"{location}%"),
+        (category, confidence_threshold, f"{location}%"),
     )
 
     # Group rows by image. dict preserves insertion order (Python 3.7+) → matches the SQL ordering.
@@ -319,6 +323,7 @@ def sample_images_by_category(
     target_total: int,
     category_name: str,
     diversity_config: DiversityConfig | None = None,
+    confidence_threshold: float = 0.20,
 ) -> list[ImageRecord]:
     """
     Sample images with detections of a specific category, distributed as evenly as possible across locations.
@@ -348,10 +353,10 @@ def sample_images_by_category(
 
     for location in sorted(location_stats.keys()):
         if diversity_config.enabled:
-            records = _fetch_location_records_diversity(cursor, category, location)
+            records = _fetch_location_records_diversity(cursor, category, location, confidence_threshold)
             _detect_sequences(records, diversity_config)
         else:
-            records = _fetch_location_records_legacy(cursor, category, location)
+            records = _fetch_location_records_legacy(cursor, category, location, confidence_threshold)
 
         location_availability[location] = {
             'available': len(records),
@@ -578,6 +583,7 @@ def export_images(
     exclude_locations: str | None = None,
     diversity_config: DiversityConfig | None = None,
     skip_export: bool = False,
+    confidence_threshold: float = 0.20,
 ):
     """Export images from database to output directory with subdirectory organization"""
 
@@ -608,19 +614,21 @@ def export_images(
             location = path_parts[0] if path_parts else file_path
             location_stats[location] = location_stats.get(location, 0) + 1
 
-        # Get detection counts by category and location
-        def get_detection_stats_by_category(category):
+        # Get detection counts by category and location. count_hard=True selects only
+        # hard-flagged detections; the default counts the non-hard ones used for sampling.
+        def get_detection_stats_by_category(category, count_hard=False):
+            hard_clause = "d.hard = 1" if count_hard else "(d.hard = 0 OR d.hard IS NULL)"
             cursor.execute(
-                """
+                f"""
                 SELECT i.file_path, COUNT(*) as detection_count
                 FROM images i
                 JOIN detections d ON i.id = d.image_id
                 WHERE d.category = ? AND d.deleted = 0
-                  AND (d.hard = 0 OR d.hard IS NULL)
-                  AND d.confidence >= 0.20
+                  AND {hard_clause}
+                  AND d.confidence >= ?
                 GROUP BY i.id, i.file_path
                 """,
-                (category,),
+                (category, confidence_threshold),
             )
             results = cursor.fetchall()
 
@@ -633,28 +641,36 @@ def export_images(
             return stats
 
         gang_gang_stats = get_detection_stats_by_category(1)
+        gang_gang_hard = get_detection_stats_by_category(1, count_hard=True)
         possum_stats = get_detection_stats_by_category(4)
+        possum_hard = get_detection_stats_by_category(4, count_hard=True)
         other_stats = get_detection_stats_by_category(5)
+        other_hard = get_detection_stats_by_category(5, count_hard=True)
+
+        def _fmt(stats, hard_stats, location):
+            return f"{stats.get(location, 0)} ({hard_stats.get(location, 0)} hard)"
 
         # Print location statistics
-        print("\nImage count by location:")
+        print("\nImage count by location:  (hard = manually-flagged-difficult detections)")
         print("-" * 60)
         for location, count in sorted(location_stats.items()):
-            gang_gang_count = gang_gang_stats.get(location, 0)
-            possum_count = possum_stats.get(location, 0)
-            other_count = other_stats.get(location, 0)
             print(
-                f"{location}: {count} images, {gang_gang_count} Gang Gang detections, "
-                f"{possum_count} Possum detections, {other_count} Other detections"
+                f"{location}: {count} images | "
+                f"Gang Gang: {_fmt(gang_gang_stats, gang_gang_hard, location)} | "
+                f"Possum: {_fmt(possum_stats, possum_hard, location)} | "
+                f"Other: {_fmt(other_stats, other_hard, location)}"
             )
 
         print(f"\nTotal locations: {len(location_stats)}")
         total_gang_gangs = sum(gang_gang_stats.values())
         total_possums = sum(possum_stats.values())
         total_others = sum(other_stats.values())
-        print(f"Total Gang Gang detections: {total_gang_gangs}")
-        print(f"Total Possum detections: {total_possums}")
-        print(f"Total Other detections: {total_others}")
+        total_gang_gang_hard = sum(gang_gang_hard.values())
+        total_possum_hard = sum(possum_hard.values())
+        total_other_hard = sum(other_hard.values())
+        print(f"Total Gang Gang detections: {total_gang_gangs} ({total_gang_gang_hard} hard)")
+        print(f"Total Possum detections: {total_possums} ({total_possum_hard} hard)")
+        print(f"Total Other detections: {total_others} ({total_other_hard} hard)")
 
         # Apply location filtering
         filtered_location_stats = location_stats.copy()
@@ -679,12 +695,11 @@ def export_images(
             print(f"\nFiltered location statistics:")
             for location in sorted(filtered_location_stats.keys()):
                 image_count = filtered_location_stats[location]
-                gang_gang_count = gang_gang_stats.get(location, 0)
-                possum_count = possum_stats.get(location, 0)
-                other_count = other_stats.get(location, 0)
                 print(
-                    f"{location}: {image_count} images, {gang_gang_count} Gang Gang detections, "
-                    f"{possum_count} Possum detections, {other_count} Other detections"
+                    f"{location}: {image_count} images | "
+                    f"Gang Gang: {_fmt(gang_gang_stats, gang_gang_hard, location)} | "
+                    f"Possum: {_fmt(possum_stats, possum_hard, location)} | "
+                    f"Other: {_fmt(other_stats, other_hard, location)}"
                 )
 
         # Use filtered locations for sampling
@@ -695,17 +710,20 @@ def export_images(
 
         if target_gang_gang:
             all_selected_images.extend(
-                sample_images_by_category(cursor, location_stats, 1, target_gang_gang, "Gang Gang", diversity_config)
+                sample_images_by_category(cursor, location_stats, 1, target_gang_gang, "Gang Gang",
+                                          diversity_config, confidence_threshold)
             )
 
         if target_possum:
             all_selected_images.extend(
-                sample_images_by_category(cursor, location_stats, 4, target_possum, "Possum", diversity_config)
+                sample_images_by_category(cursor, location_stats, 4, target_possum, "Possum",
+                                          diversity_config, confidence_threshold)
             )
 
         if target_other:
             all_selected_images.extend(
-                sample_images_by_category(cursor, location_stats, 5, target_other, "Other", diversity_config)
+                sample_images_by_category(cursor, location_stats, 5, target_other, "Other",
+                                          diversity_config, confidence_threshold)
             )
 
         # Remove duplicates based on file_path (some images may be selected for multiple categories).
@@ -760,10 +778,10 @@ def export_images(
                     FROM detections
                     WHERE image_id = ? AND deleted = 0
                       AND (hard = 0 OR hard IS NULL)
-                      AND confidence >= 0.20
+                      AND confidence >= ?
                     ORDER BY confidence DESC
                     """,
-                    (image_id,),
+                    (image_id, confidence_threshold),
                 )
                 detections_rows = cursor.fetchall()
 
@@ -880,8 +898,14 @@ def main():
                         help='RNG seed for diversity sampling (default 0)')
     parser.add_argument('--skip-export', action='store_true',
                         help='Skip copying image files; write metadata.json only')
+    parser.add_argument('--confidence-threshold', type=float, default=0.20,
+                        help='Minimum detection confidence to consider (default 0.20)')
 
     args = parser.parse_args()
+
+    if not (0.0 <= args.confidence_threshold <= 1.0):
+        print(f"Error: --confidence-threshold must be in [0.0, 1.0], got {args.confidence_threshold}")
+        return 1
 
     # Validate arguments
     if not os.path.exists(args.db_file):
@@ -924,6 +948,7 @@ def main():
         args.exclude_locations,
         diversity_config=diversity_config,
         skip_export=args.skip_export,
+        confidence_threshold=args.confidence_threshold,
     )
 
 
