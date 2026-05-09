@@ -14,10 +14,11 @@ def run_all_tests():
     # Test modules to run
     test_modules = [
         'test_database',
-        'test_controller', 
+        'test_controller',
         'test_integration',
         'test_renderer',
-        'test_ui'
+        'test_ui',
+        'test_mkdataset'
     ]
     
     print("=" * 80)
