@@ -6,6 +6,7 @@ import cv2
 import argparse
 import sys
 
+from collections import Counter
 from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass
 
@@ -21,7 +22,7 @@ CORNER_KNOB_COLOR = (180, 180, 180)  # Light grey  color for corner knobs
 # Color mapping for different categories (in BGR format)
 COLORS = {
     '1': (0, 0, 255),  # Red for GangGangs
-    '2': (255, 0, 0),  # Blue for persons
+    '2': (255, 64, 64),  # Blue for persons
     '3': (0, 255, 0),  # Green for vehicles
     '4': (66, 200, 94),  # Yellow for possums
     '5': (255, 255, 0),  # Purple for other
@@ -32,6 +33,7 @@ CATEGORY_KEYS = {
     112: {'id': 4, 'name': 'Possum'},  # 'p' key
     111: {'id': 5, 'name': 'Other'},  # 'o' key
     103: {'id': 1, 'name': 'GangGang'},  # 'g' key
+    101: {'id': 2, 'name': 'Person'},  # 'e' key (mnemonic: pErson)
 }
 
 # Category key mappings for ALL detections in image (uppercase versions)
@@ -383,7 +385,7 @@ class DatabaseManager:
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            UPDATE detections 
+            UPDATE detections
             SET x = ?, y = ?, width = ?, height = ?
             WHERE id = ?
         """,
@@ -391,6 +393,28 @@ class DatabaseManager:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def add_detection(
+        self,
+        image_id: int,
+        category: int,
+        confidence: float,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+    ) -> Optional[int]:
+        """Insert a new detection. Returns the new id, or None on failure."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO detections (image_id, category, confidence, x, y, width, height, deleted, subcategory, hard) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, 0)',
+            (image_id, category, confidence, x, y, width, height),
+        )
+        self.conn.commit()
+        if cursor.rowcount > 0:
+            return cursor.lastrowid
+        return None
 
     def mark_all_detections_deleted(self, image_id: int) -> int:
         """Mark all detections on a specific image as deleted. Returns number of detections affected."""
@@ -980,6 +1004,57 @@ class DetectionController:
             print('No detections found to mark as deleted')
             return False
 
+    def add_new_detection_at_mouse(self, state: AppState, original_img, image_id: int) -> bool:
+        """Insert a new detection with top-left at the current mouse position.
+
+        Default size is 10% x 10% of the image. Top-left is clamped to [0,1] and
+        width/height are shrunk so the box stays inside the image. Category is the
+        mode of non-deleted existing detections; falls back to 5 ('Other')."""
+        if original_img is None:
+            print('Error: No image available for new detection')
+            return False
+        if image_id is None:
+            print('Error: No image ID available for new detection')
+            return False
+
+        img_height, img_width = original_img.shape[:2]
+
+        x = max(0.0, min(1.0, state.mouse_x / img_width))
+        y = max(0.0, min(1.0, state.mouse_y / img_height))
+        width = min(0.1, 1.0 - x)
+        height = min(0.1, 1.0 - y)
+
+        if width <= 0 or height <= 0:
+            print('Cannot add detection: mouse is at the image edge (no room for box)')
+            return False
+
+        non_deleted_categories = [box.detection.category for box in state.current_boxes if not box.is_deleted]
+        if non_deleted_categories:
+            category = Counter(non_deleted_categories).most_common(1)[0][0]
+        else:
+            category = 5  # Other
+
+        new_id = self.db_manager.add_detection(
+            image_id=image_id,
+            category=int(category),
+            confidence=1.0,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+        )
+
+        if new_id is not None:
+            print(
+                f'Added new detection {new_id} at x={x:.3f}, y={y:.3f}, '
+                f'w={width:.3f}, h={height:.3f}, category={int(category)}'
+            )
+            state.need_redraw = True
+            return True
+
+        print('Failed to add new detection')
+        return False
+
     def add_autodelete_template(self, detection_id: int, original_img, state: AppState) -> bool:
         """Add a detection as an autodelete template"""
         # Find the detection in current boxes
@@ -1348,6 +1423,13 @@ class UserInterface:
                     self.state.need_redraw = True
         elif key == 9:  # TAB key for cycling through overlapping detections
             self.controller.cycle_overlapping_detections(self.state)
+        elif key == 78:  # 'N' key (Shift+n) for adding a new detection at the mouse position
+            if original_img is not None and image_id is not None:
+                success = self.controller.add_new_detection_at_mouse(self.state, original_img, image_id)
+                if success:
+                    self.state.need_redraw = True
+            else:
+                print('Error: No image or image ID available for adding new detection')
         elif key in CATEGORY_KEYS:  # Category change keys (p, o, etc.)
             if self.controller.handle_category_change(self.state.selected_detection_id, CATEGORY_KEYS[key], image_id):
                 self.state.need_redraw = True
