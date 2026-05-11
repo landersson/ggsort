@@ -50,6 +50,11 @@ DELETED_COLOR = (128, 128, 128)  # Grey
 TEMPLATE_COLOR = (128, 128, 128)  # Grey
 TEMPLATE_LINE_WIDTH = 2
 
+# Sentinel returned by handle_key_press to request an absolute jump to
+# state.goto_target_index. Picked to not collide with the relative-step results
+# (0, 1, -1, 10, -10).
+GOTO_FRAME_RESULT = 99999
+
 
 @dataclass
 class Detection:
@@ -124,6 +129,11 @@ class AppState:
 
         # Performance optimization for dragging
         self.last_drag_redraw_pos: Optional[Tuple[int, int]] = None
+
+        # Goto frame state (vim-style: digits accumulate, Shift+J jumps).
+        # goto_target_index is the 0-indexed target staged for the run() loop.
+        self.goto_number_buffer: str = ''
+        self.goto_target_index: Optional[int] = None
 
     def reset_relocation_mode(self):
         """Reset relocation mode state"""
@@ -1315,6 +1325,37 @@ class UserInterface:
         """Handle key press events. Returns navigation command or None"""
         # print(f"Key pressed: {key}")
 
+        # --- Goto frame (vim-style): digits accumulate, Shift+J jumps. ---
+        # Digit keys (0-9) only buffer when we're not in a special mode that
+        # would otherwise consume them.
+        if 48 <= key <= 57 and not self.state.corner_dragging_mode and not self.state.relocation_mode:
+            self.state.goto_number_buffer += chr(key)
+            self.state.need_redraw = True
+            return None
+
+        if key == 74 and not self.state.corner_dragging_mode and not self.state.relocation_mode:  # 'J' (Shift+j)
+            if self.state.goto_number_buffer:
+                # The on-screen counter is 1-indexed, so the buffer is too.
+                target_index = int(self.state.goto_number_buffer) - 1
+                print(f'Jumping to frame {self.state.goto_number_buffer}')
+                self.state.goto_number_buffer = ''
+                self.state.goto_target_index = target_index
+                self.state.need_redraw = True
+                return GOTO_FRAME_RESULT
+            print('No frame number buffered. Type digits before pressing J.')
+            return None
+
+        # Any other key while a buffer is pending clears it. ESC just clears
+        # the buffer instead of exiting so users can abort a partial goto.
+        if self.state.goto_number_buffer:
+            if key == 27 and not self.state.corner_dragging_mode:
+                self.state.goto_number_buffer = ''
+                self.state.need_redraw = True
+                print('Goto buffer cleared')
+                return None
+            self.state.goto_number_buffer = ''
+            self.state.need_redraw = True
+
         # Handle escape key specially to cancel corner dragging
         if key == 27:  # ESC key
             if self.state.corner_dragging_mode:
@@ -1467,6 +1508,9 @@ class UserInterface:
 
         self.state.reset_overlapping_detections()
 
+        # Discard any in-progress goto buffer when navigating to a new image.
+        self.state.goto_number_buffer = ''
+
         # Get detections for this image
         detections = db_manager.get_detections_for_image(image_id, confidence_threshold)
 
@@ -1501,7 +1545,6 @@ class UserInterface:
 
         # Display info
         basename = os.path.basename(image_path)
-        display_text = f'{current_index + 1} / {total_images} : {basename}'
 
         # a = 1
         a = 2
@@ -1537,20 +1580,48 @@ class UserInterface:
                 )
                 self._last_closest_corner_info = closest_corner_info
 
-                # Add filename text
-                text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
-                text_height = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[1]
-                text_x = int(updated_img.shape[1] / 2 - text_size[0] / 2)
-                text_y = int(updated_img.shape[0] - text_height - 0)
+                # Build display text fresh each redraw. The base counter stays
+                # red (low distraction); the goto buffer suffix renders white
+                # so it pops while you're typing a jump target.
+                base_text = f'{current_index + 1} / {total_images} : {basename}'
+                goto_suffix = f' | goto: {self.state.goto_number_buffer}' if self.state.goto_number_buffer else ''
+
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.9
+                font_thickness = 2
+
+                # NOTE: the original positioning used getTextSize()[1] which is
+                # the *baseline*, not the text height — preserve that so the y
+                # position matches the previous single-putText layout exactly.
+                base_size = cv2.getTextSize(base_text, font, font_scale, font_thickness)
+                base_w = base_size[0][0]
+                base_baseline = base_size[1]
+                suffix_w = (
+                    cv2.getTextSize(goto_suffix, font, font_scale, font_thickness)[0][0] if goto_suffix else 0
+                )
+                total_w = base_w + suffix_w
+                text_x = int(updated_img.shape[1] / 2 - total_w / 2)
+                text_y = int(updated_img.shape[0] - base_baseline - 0)
+
                 cv2.putText(
                     updated_img,
-                    display_text,
+                    base_text,
                     (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
+                    font,
+                    font_scale,
                     (0, 0, 255),
-                    2,
+                    font_thickness,
                 )
+                if goto_suffix:
+                    cv2.putText(
+                        updated_img,
+                        goto_suffix,
+                        (text_x + base_w, text_y),
+                        font,
+                        font_scale,
+                        (255, 255, 255),
+                        font_thickness,
+                    )
 
                 cv2.imshow(self.window_name, updated_img)
                 self.state.need_redraw = False
@@ -1578,6 +1649,11 @@ class UserInterface:
                     )
                 elif result == -10:
                     db_manager.save_last_image_index(max(0, current_index - 10))
+                elif result == GOTO_FRAME_RESULT:
+                    target = self.state.goto_target_index
+                    if target is not None:
+                        clamped = max(0, min(target, total_images - 1))
+                        db_manager.save_last_image_index(clamped)
                 return result
 
 
@@ -1741,6 +1817,17 @@ class GGSortApplication:
                         print(f'No previous images with active detections after jumping backward')
                         continue
                     print(f'Jumping backward to image {new_i + 1}/{total_images}')
+                    i = new_i
+                elif result == GOTO_FRAME_RESULT:
+                    # Absolute jump to a frame requested via the goto buffer.
+                    # Skip-empty-images logic is intentionally bypassed: a goto
+                    # should land exactly where the user typed.
+                    target = self.state.goto_target_index
+                    self.state.goto_target_index = None
+                    if target is None:
+                        continue
+                    new_i = max(0, min(target, total_images - 1))
+                    print(f'Jumping to frame {new_i + 1}/{total_images}')
                     i = new_i
 
             return 0
