@@ -16,6 +16,7 @@ def run_all_tests():
         'test_database',
         'test_controller',
         'test_integration',
+        'test_split_merge_roundtrip',
         'test_renderer',
         'test_ui',
         'test_mkdataset'
@@ -223,7 +224,7 @@ def run_specific_test_category(category):
     category_map = {
         'database': ['test_database'],
         'controller': ['test_controller'],
-        'integration': ['test_integration'], 
+        'integration': ['test_integration', 'test_split_merge_roundtrip'],
         'renderer': ['test_renderer'],
         'ui': ['test_ui'],
         'core': ['test_database', 'test_controller'],

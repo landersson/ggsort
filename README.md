@@ -43,7 +43,7 @@ The system supports five categories with color-coded bounding boxes:
 | Gang-gang | Red | Gang-gang Cockatoos |
 | Person | Blue | Human detections |
 | Vehicle | Green | Vehicles |
-| Possum | Yellow | Possums |
+| Possum | Green | Possums |
 | Other | Turquoise | Other wildlife |
 
 Deleted detections are shown in grey.
