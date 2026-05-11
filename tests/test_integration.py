@@ -191,66 +191,54 @@ class TestIntegrationDatabaseUI(unittest.TestCase):
         self.assertEqual(detection_final.category, 5)  # Other
     
     def test_relocation_integration(self):
-        """Test that detection relocation works end-to-end"""
-        # Create a mock image for coordinate calculations
+        """Detection relocation now flows through insert mode: 'c' enters the
+        mode targeting the selected detection, then two clicks (or SPACEs)
+        pick the new corners, and the DB row is updated in place."""
         mock_img = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        
-        # Setup: Select a detection and store the image in UI
+
+        # Setup: select a detection and prime the UI image cache + image_id.
         self.state.selected_detection_id = 1
-        self.ui.current_original_img = mock_img  # Store image for relocation
-        
-        # Verify initial coordinates
+        self.ui.current_original_img = mock_img
+        self.ui._current_image_id = 1
+
+        # Verify initial coordinates.
         detections_before = self.db_manager.get_detections_for_image(1, 0.0)
         detection_before = next(d for d in detections_before if d.id == 1)
         self.assertEqual(detection_before.x, 0.1)
         self.assertEqual(detection_before.y, 0.2)
         self.assertEqual(detection_before.width, 0.3)
         self.assertEqual(detection_before.height, 0.4)
-        
-        # Step 1: Enter relocation mode (99 = 'c')
-        with patch('builtins.print') as mock_print:
+
+        # Step 1: 'c' enters relocation flavor of insert mode.
+        with patch('builtins.print'):
             result = self.ui.handle_key_press(99, mock_img)
-        
         self.assertIsNone(result)
-        self.assertTrue(self.state.relocation_mode)
-        self.assertEqual(self.state.relocation_detection_id, 1)
-        self.assertEqual(len(self.state.relocation_clicks), 0)
-        
-        # Step 2: Simulate first click (top-left)
-        self.ui.mouse_callback(1, 100, 200, 0, None)  # cv2.EVENT_LBUTTONDOWN = 1
-        self.assertEqual(len(self.state.relocation_clicks), 1)
-        self.assertEqual(self.state.relocation_clicks[0], (100, 200))
-        self.assertTrue(self.state.relocation_mode)  # Should still be in relocation mode
-        
-        # Step 3: Simulate second click (bottom-right) - this should complete relocation immediately
-        with patch('builtins.print') as mock_print:
+        self.assertTrue(self.state.insert_mode)
+        self.assertEqual(self.state.insert_target_detection_id, 1)
+        self.assertEqual(self.state.insert_stage, 'awaiting_top_left')
+
+        # Step 2: first click locks the top-left.
+        with patch('builtins.print'):
+            self.ui.mouse_callback(1, 100, 200, 0, None)  # cv2.EVENT_LBUTTONDOWN = 1
+        self.assertTrue(self.state.insert_mode)
+        self.assertEqual(self.state.insert_stage, 'awaiting_bottom_right')
+        self.assertEqual(self.state.insert_top_left, (100, 200))
+
+        # Step 3: second click finalises the relocation.
+        with patch('builtins.print'):
             self.ui.mouse_callback(1, 400, 600, 0, None)
-        
-        # Verify relocation was applied immediately
-        self.assertFalse(self.state.relocation_mode)  # Should exit relocation mode immediately
-        self.assertEqual(len(self.state.relocation_clicks), 0)  # Should be reset
-        
-        # Verify database was updated with new coordinates
+
+        # Mode cleared after success.
+        self.assertFalse(self.state.insert_mode)
+        self.assertIsNone(self.state.insert_target_detection_id)
+
+        # DB row updated to the new normalized coords.
         detections_after = self.db_manager.get_detections_for_image(1, 0.0)
         detection_after = next(d for d in detections_after if d.id == 1)
-        
-        # Expected normalized coordinates: (100/1920, 200/1080, 300/1920, 400/1080)
-        expected_x = 100 / 1920  # ≈ 0.052
-        expected_y = 200 / 1080  # ≈ 0.185
-        expected_width = 300 / 1920  # ≈ 0.156
-        expected_height = 400 / 1080  # ≈ 0.370
-        
-        self.assertAlmostEqual(detection_after.x, expected_x, places=3)
-        self.assertAlmostEqual(detection_after.y, expected_y, places=3)
-        self.assertAlmostEqual(detection_after.width, expected_width, places=3)
-        self.assertAlmostEqual(detection_after.height, expected_height, places=3)
-        
-        # Verify print messages
-        expected_calls = [
-            call("Click 2: (400, 600)"),
-            call("Two clicks recorded. Applying new coordinates..."),
-        ]
-        mock_print.assert_has_calls(expected_calls, any_order=False)
+        self.assertAlmostEqual(detection_after.x, 100 / 1920, places=3)
+        self.assertAlmostEqual(detection_after.y, 200 / 1080, places=3)
+        self.assertAlmostEqual(detection_after.width, 300 / 1920, places=3)
+        self.assertAlmostEqual(detection_after.height, 400 / 1080, places=3)
     
     def test_overlapping_detection_cycling_integration(self):
         """Test cycling through overlapping detections with database consistency"""
@@ -348,9 +336,12 @@ class TestIntegrationDatabaseUI(unittest.TestCase):
         # Test relocation with no selection
         with patch('builtins.print') as mock_print:
             result = self.ui.handle_key_press(99, None)  # 'c' key
-        
+
         self.assertIsNone(result)
-        self.assertFalse(self.state.relocation_mode)
+        self.assertFalse(self.state.insert_mode)
+        mock_print.assert_called_with(
+            'No detection selected. Hover over a detection to select it first.'
+        )
     
     def test_database_transaction_consistency(self):
         """Test that database operations maintain consistency"""

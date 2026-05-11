@@ -111,11 +111,6 @@ class AppState:
         self.need_redraw: bool = False
         self.selected_detection_id: Optional[int] = None
 
-        # Relocation mode state
-        self.relocation_mode: bool = False
-        self.relocation_detection_id: Optional[int] = None
-        self.relocation_clicks: List[Tuple[int, int]] = []
-
         # Overlapping detections state
         self.overlapping_detections: List[BoundingBox] = []
         self.current_overlap_index: int = 0
@@ -130,16 +125,21 @@ class AppState:
         # Performance optimization for dragging
         self.last_drag_redraw_pos: Optional[Tuple[int, int]] = None
 
+        # Insert mode state (interactive two-step bbox placement, used both
+        # for creating new detections and relocating an existing one).
+        self.insert_mode: bool = False
+        # 'awaiting_top_left' | 'awaiting_bottom_right'
+        self.insert_stage: Optional[str] = None
+        # Locked pixel coords after first confirm
+        self.insert_top_left: Optional[Tuple[int, int]] = None
+        # None → finalising creates a new detection; set → finalising relocates
+        # this existing detection. Set when entering relocate flow via 'c'.
+        self.insert_target_detection_id: Optional[int] = None
+
         # Goto frame state (vim-style: digits accumulate, Shift+J jumps).
         # goto_target_index is the 0-indexed target staged for the run() loop.
         self.goto_number_buffer: str = ''
         self.goto_target_index: Optional[int] = None
-
-    def reset_relocation_mode(self):
-        """Reset relocation mode state"""
-        self.relocation_mode = False
-        self.relocation_detection_id = None
-        self.relocation_clicks = []
 
     def reset_overlapping_detections(self):
         """Reset overlapping detection state"""
@@ -154,6 +154,13 @@ class AppState:
         self.original_detection_coords = None
         self.drag_start_mouse_pos = None
         self.last_drag_redraw_pos = None
+
+    def reset_insert_mode(self):
+        """Reset insert mode state"""
+        self.insert_mode = False
+        self.insert_stage = None
+        self.insert_top_left = None
+        self.insert_target_detection_id = None
 
     def get_corner_type(self, box: BoundingBox, corner_x: int, corner_y: int) -> str:
         """Determine which corner of the box the coordinates represent"""
@@ -691,8 +698,9 @@ class DetectionRenderer:
         # Find the closest corner across all non-deleted detections
         closest_corner_info = self.find_closest_corner(detection_boxes, state.mouse_x, state.mouse_y)
 
-        # Handle overlapping detections (only if not in relocation mode and not dragging)
-        if not state.relocation_mode and not state.corner_dragging_mode:
+        # Handle overlapping detections (only if not in insert mode and not dragging).
+        # Insert mode covers both new-detection and relocate flows.
+        if not state.insert_mode and not state.corner_dragging_mode:
             current_overlapping = self.find_overlapping_detections(detection_boxes, state.mouse_x, state.mouse_y)
 
             # Check if overlapping detections changed
@@ -719,9 +727,11 @@ class DetectionRenderer:
         for box in detection_boxes:
             self._draw_single_box(img_copy, box, state, closest_corner_info)
 
-        # Draw relocation UI elements (skip during corner dragging)
-        if state.relocation_mode and not state.corner_dragging_mode:
-            self._draw_relocation_ui(img_copy, state)
+        # Draw insert-mode crosshair / preview. Insert mode now also covers
+        # relocation (see DetectionController.enter_insert_mode); the relocated
+        # detection is drawn black by _draw_single_box.
+        if state.insert_mode:
+            self._draw_insert_mode_ui(img_copy, state)
 
         return img_copy
 
@@ -734,11 +744,15 @@ class DetectionRenderer:
     ):
         """Draw a single detection box"""
         is_selected = box.detection_id == state.selected_detection_id
-        is_being_relocated = state.relocation_mode and box.detection_id == state.relocation_detection_id
+        # The detection being relocated lives inside insert mode now; it's
+        # painted black so the user can see what they're about to move.
+        is_being_relocated = (
+            state.insert_mode and box.detection_id == state.insert_target_detection_id
+        )
         is_being_dragged = state.corner_dragging_mode and box.detection_id == state.dragged_corner_detection_id
 
         # Draw outline
-        if is_selected and not state.relocation_mode:
+        if is_selected and not state.insert_mode:
             cv2.rectangle(
                 img_copy,
                 (box.x_min, box.y_min),
@@ -759,8 +773,10 @@ class DetectionRenderer:
 
         cv2.rectangle(img_copy, (box.x_min, box.y_min), (box.x_max, box.y_max), color, 4)
 
-        # Draw corner knob if this detection has the closest corner and is not in relocation mode
-        if not state.relocation_mode:
+        # Draw corner knob if this detection has the closest corner. Skip
+        # entirely during insert mode (new placement *or* relocation) so the
+        # knobs don't clutter the placement UI.
+        if not state.insert_mode:
             # Handle dragging mode separately
             if state.corner_dragging_mode and state.dragged_corner_detection_id == box.detection_id:
                 # Always show white knob at mouse position when dragging this detection
@@ -862,28 +878,83 @@ class DetectionRenderer:
                 1,
             )
 
-    def _draw_relocation_ui(self, img_copy, state: AppState):
-        """Draw relocation mode UI elements"""
-        for i, (click_x, click_y) in enumerate(state.relocation_clicks):
-            cv2.circle(img_copy, (click_x, click_y), 8, (0, 255, 255), -1)
-            cv2.putText(
-                img_copy,
-                str(i + 1),
-                (click_x - 5, click_y + 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 0),
-                2,
-            )
+    def _draw_insert_mode_ui(self, img_copy, state: AppState):
+        """Draw the insert-mode crosshair, preview rectangle, and status text.
 
-        if len(state.relocation_clicks) == 2:
-            x1, y1 = state.relocation_clicks[0]
-            x2, y2 = state.relocation_clicks[1]
-            new_x_min = min(x1, x2)
-            new_y_min = min(y1, y2)
-            new_x_max = max(x1, x2)
-            new_y_max = max(y1, y2)
-            cv2.rectangle(img_copy, (new_x_min, new_y_min), (new_x_max, new_y_max), (0, 255, 0), 3)
+        While picking the top-left, we draw an L-shaped crosshair (mouse →
+        right edge, mouse → bottom edge) as a 2 px pixel-inversion stripe
+        flanked by 1 px black borders on the outside of the L. Inversion alone
+        is hard to see over mid-grey or busy textures; the black borders give
+        the stripe a guaranteed-contrast silhouette without sacrificing the
+        inverted center's adaptiveness.
+
+        Once the top-left is locked, the crosshair is dropped — the live
+        preview rectangle already shows exactly where the second corner will
+        land, so the crosshair lines only get in the way."""
+        height, width = img_copy.shape[:2]
+        mx = max(0, min(width - 1, state.mouse_x))
+        my = max(0, min(height - 1, state.mouse_y))
+
+        if state.insert_stage == 'awaiting_top_left':
+            # Inverted horizontal stripe: rows [my, my+2), cols [mx, W).
+            hy_end = min(height, my + 2)
+            if hy_end > my and mx < width:
+                img_copy[my:hy_end, mx:width] = 255 - img_copy[my:hy_end, mx:width]
+
+            # Inverted vertical stripe: rows [my+2, H), cols [mx, mx+2). Start
+            # past the horizontal stripe so the corner isn't re-inverted.
+            vx_end = min(width, mx + 2)
+            v_y_start = min(height, my + 2)
+            if vx_end > mx and v_y_start < height:
+                img_copy[v_y_start:height, mx:vx_end] = 255 - img_copy[v_y_start:height, mx:vx_end]
+
+            # Black borders flanking the L on the outside. Each border is
+            # placed AFTER the inversion so we paint over pixels at the stripe
+            # boundary, not on top of inverted ones.
+            # Top edge of horizontal: row my-1, cols [mx, W).
+            if my - 1 >= 0:
+                img_copy[my - 1, mx:width] = 0
+            # Bottom edge of horizontal: row my+2, cols [mx+2, W).
+            # (Cols mx..mx+1 of row my+2 are the head of the vertical stripe.)
+            if my + 2 < height and mx + 2 < width:
+                img_copy[my + 2, mx + 2:width] = 0
+            # Left edge of vertical: col mx-1, rows [my+2, H).
+            if mx - 1 >= 0 and my + 2 < height:
+                img_copy[my + 2:height, mx - 1] = 0
+            # Right edge of vertical: col mx+2, rows [my+2, H).
+            if mx + 2 < width and my + 2 < height:
+                img_copy[my + 2:height, mx + 2] = 0
+
+        # Preview rectangle once the top-left is locked. Match the existing
+        # detection-box stroke (black outline 10, fill stroke 4 — see
+        # _draw_single_box) so the preview reads as a regular detection box.
+        if state.insert_stage == 'awaiting_bottom_right' and state.insert_top_left is not None:
+            tlx, tly = state.insert_top_left
+            cv2.rectangle(img_copy, (tlx, tly), (mx, my), (0, 0, 0), 10)
+            cv2.rectangle(img_copy, (tlx, tly), (mx, my), (255, 255, 255), 4)
+            # Mark the locked top-left so the user can see exactly where it
+            # is. Black halo behind the yellow dot for the same reason.
+            cv2.circle(img_copy, (tlx, tly), 7, (0, 0, 0), -1)
+            cv2.circle(img_copy, (tlx, tly), 6, (0, 255, 255), -1)
+
+        # Status text in the top-right; the frame counter lives along the
+        # bottom-centre so there's no collision.
+        msg = (
+            'Insert: top-left'
+            if state.insert_stage == 'awaiting_top_left'
+            else 'Insert: bottom-right'
+        )
+        (text_w, _), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        text_x = max(10, width - text_w - 20)
+        cv2.putText(
+            img_copy,
+            msg,
+            (text_x, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+        )
 
 
 class DetectionController:
@@ -940,70 +1011,6 @@ class DetectionController:
         state.need_redraw = True
         return True
 
-    def handle_relocation_mode(self, state: AppState) -> bool:
-        """Handle relocation mode toggle and processing"""
-        if not state.relocation_mode:
-            if state.selected_detection_id is None:
-                print('No detection selected. Hover over a detection to select it first.')
-                return False
-
-            print(f'Entering relocation mode for detection {state.selected_detection_id}')
-            print('Click twice to define new bounding box: first click = top-left, second click = bottom-right')
-            print("Press 'c' again to cancel relocation")
-
-            state.relocation_mode = True
-            state.relocation_detection_id = state.selected_detection_id
-            state.relocation_clicks = []
-            state.need_redraw = True
-            return True
-        else:
-            print('Cancelled relocation mode')
-            state.reset_relocation_mode()
-            state.need_redraw = True
-            return True
-
-    def apply_relocation(self, state: AppState, original_img) -> bool:
-        """Apply the relocation changes to the database"""
-        if len(state.relocation_clicks) != 2:
-            print('Error: Need exactly 2 clicks to apply relocation')
-            return False
-
-        height, width = original_img.shape[:2]
-
-        x1, y1 = state.relocation_clicks[0]
-        x2, y2 = state.relocation_clicks[1]
-
-        new_x_min = min(x1, x2)
-        new_y_min = min(y1, y2)
-        new_x_max = max(x1, x2)
-        new_y_max = max(y1, y2)
-
-        # Convert to normalized coordinates
-        new_x = new_x_min / width
-        new_y = new_y_min / height
-        new_width = (new_x_max - new_x_min) / width
-        new_height = (new_y_max - new_y_min) / height
-
-        # Ensure coordinates are within valid range
-        new_x = max(0, min(1, new_x))
-        new_y = max(0, min(1, new_y))
-        new_width = max(0, min(1 - new_x, new_width))
-        new_height = max(0, min(1 - new_y, new_height))
-
-        success = self.db_manager.update_detection_coordinates(
-            state.relocation_detection_id, new_x, new_y, new_width, new_height
-        )
-
-        if success:
-            print(f'Successfully relocated detection {state.relocation_detection_id}')
-            print(f'New coordinates: x={new_x:.3f}, y={new_y:.3f}, width={new_width:.3f}, height={new_height:.3f}')
-        else:
-            print(f'Failed to relocate detection {state.relocation_detection_id}')
-
-        state.reset_relocation_mode()
-        state.need_redraw = True
-        return success
-
     def mark_all_detections_deleted(self, image_id: int) -> bool:
         """Mark all detections on the current image as deleted"""
         affected_count = self.db_manager.mark_all_detections_deleted(image_id)
@@ -1014,55 +1021,145 @@ class DetectionController:
             print('No detections found to mark as deleted')
             return False
 
-    def add_new_detection_at_mouse(self, state: AppState, original_img, image_id: int) -> bool:
-        """Insert a new detection with top-left at the current mouse position.
+    def _majority_category(self, state: AppState) -> int:
+        """Return the most common category among non-deleted detections in the
+        current image; fall back to 5 ('Other') when there are none."""
+        non_deleted = [box.detection.category for box in state.current_boxes if not box.is_deleted]
+        if non_deleted:
+            return int(Counter(non_deleted).most_common(1)[0][0])
+        return 5
 
-        Default size is 10% x 10% of the image. Top-left is clamped to [0,1] and
-        width/height are shrunk so the box stays inside the image. Category is the
-        mode of non-deleted existing detections; falls back to 5 ('Other')."""
-        if original_img is None:
-            print('Error: No image available for new detection')
+    def enter_insert_mode(self, state: AppState, target_detection_id: Optional[int] = None) -> bool:
+        """Enter (or toggle off) the interactive two-step box-placement mode.
+
+        Stage 1: user hovers and confirms the top-left corner (SPACE or click).
+        Stage 2: user moves to the bottom-right corner and confirms again. ESC
+        cancels.
+
+        When ``target_detection_id`` is None, finalising the second corner
+        creates a new detection (majority-class category, confidence 1.0).
+        When it's set, finalising relocates that existing detection to the new
+        coords instead; the detection is drawn black in the meantime so the
+        user can see what they're moving. ESC leaves the detection where it
+        was."""
+        if state.corner_dragging_mode:
+            print('Finish current mode before starting insert.')
             return False
-        if image_id is None:
-            print('Error: No image ID available for new detection')
+
+        if state.insert_mode:
+            # Toggle off — works as cancel regardless of purpose.
+            if state.insert_target_detection_id is not None:
+                print('Cancelled relocation')
+            else:
+                print('Cancelled insert mode')
+            state.reset_insert_mode()
+            state.need_redraw = True
+            return True
+
+        if target_detection_id is not None:
+            print(
+                f'Relocating detection {target_detection_id}: hover for new top-left, '
+                'SPACE or click to confirm. ESC cancels (detection stays put).'
+            )
+        else:
+            print('Insert mode: hover for top-left, SPACE or click to confirm. ESC cancels.')
+        state.insert_mode = True
+        state.insert_stage = 'awaiting_top_left'
+        state.insert_top_left = None
+        state.insert_target_detection_id = target_detection_id
+        state.need_redraw = True
+        return True
+
+    def confirm_insert_corner(self, state: AppState, original_img, image_id: int) -> bool:
+        """Confirm the current mouse position as the next corner.
+
+        On the first call, locks the top-left and advances to stage 2. On the
+        second call, builds a bbox from the locked top-left and the current
+        mouse position and either inserts a new detection or relocates the
+        existing one (depending on ``state.insert_target_detection_id``).
+        Returns True on a successful step."""
+        if not state.insert_mode or original_img is None or image_id is None:
             return False
 
         img_height, img_width = original_img.shape[:2]
+        mx = max(0, min(img_width - 1, state.mouse_x))
+        my = max(0, min(img_height - 1, state.mouse_y))
 
-        x = max(0.0, min(1.0, state.mouse_x / img_width))
-        y = max(0.0, min(1.0, state.mouse_y / img_height))
-        width = min(0.1, 1.0 - x)
-        height = min(0.1, 1.0 - y)
-
-        if width <= 0 or height <= 0:
-            print('Cannot add detection: mouse is at the image edge (no room for box)')
-            return False
-
-        non_deleted_categories = [box.detection.category for box in state.current_boxes if not box.is_deleted]
-        if non_deleted_categories:
-            category = Counter(non_deleted_categories).most_common(1)[0][0]
-        else:
-            category = 5  # Other
-
-        new_id = self.db_manager.add_detection(
-            image_id=image_id,
-            category=int(category),
-            confidence=1.0,
-            x=x,
-            y=y,
-            width=width,
-            height=height,
-        )
-
-        if new_id is not None:
+        if state.insert_stage == 'awaiting_top_left':
+            state.insert_top_left = (mx, my)
+            state.insert_stage = 'awaiting_bottom_right'
             print(
-                f'Added new detection {new_id} at x={x:.3f}, y={y:.3f}, '
-                f'w={width:.3f}, h={height:.3f}, category={int(category)}'
+                f'Top-left locked at ({mx}, {my}). Move mouse, SPACE or click for bottom-right.'
             )
             state.need_redraw = True
             return True
 
+        # awaiting_bottom_right
+        if state.insert_top_left is None:
+            # Shouldn't happen, but guard anyway and reset cleanly.
+            state.reset_insert_mode()
+            state.need_redraw = True
+            return False
+
+        tlx, tly = state.insert_top_left
+        x_min, x_max = sorted((tlx, mx))
+        y_min, y_max = sorted((tly, my))
+
+        new_x = x_min / img_width
+        new_y = y_min / img_height
+        new_w = (x_max - x_min) / img_width
+        new_h = (y_max - y_min) / img_height
+
+        # Clamp into [0, 1] just in case (mouse is already clamped above).
+        new_x = max(0.0, min(1.0, new_x))
+        new_y = max(0.0, min(1.0, new_y))
+        new_w = max(0.0, min(1.0 - new_x, new_w))
+        new_h = max(0.0, min(1.0 - new_y, new_h))
+
+        if new_w <= 0 or new_h <= 0:
+            print('Zero-sized box — keep moving and confirm again.')
+            return False
+
+        target_id = state.insert_target_detection_id
+        if target_id is not None:
+            # Relocate existing detection.
+            success = self.db_manager.update_detection_coordinates(
+                target_id, new_x, new_y, new_w, new_h
+            )
+            if success:
+                print(
+                    f'Relocated detection {target_id}: x={new_x:.3f}, y={new_y:.3f}, '
+                    f'w={new_w:.3f}, h={new_h:.3f}'
+                )
+            else:
+                print(f'Failed to relocate detection {target_id}')
+            state.reset_insert_mode()
+            state.need_redraw = True
+            return success
+
+        # Create new detection.
+        category = self._majority_category(state)
+        new_id = self.db_manager.add_detection(
+            image_id=image_id,
+            category=int(category),
+            confidence=1.0,
+            x=new_x,
+            y=new_y,
+            width=new_w,
+            height=new_h,
+        )
+        if new_id is not None:
+            print(
+                f'Added detection {new_id}: x={new_x:.3f}, y={new_y:.3f}, '
+                f'w={new_w:.3f}, h={new_h:.3f}, cat={int(category)}'
+            )
+            state.reset_insert_mode()
+            state.need_redraw = True
+            return True
+
         print('Failed to add new detection')
+        state.reset_insert_mode()
+        state.need_redraw = True
         return False
 
     def add_autodelete_template(self, detection_id: int, original_img, state: AppState) -> bool:
@@ -1104,6 +1201,9 @@ class DetectionController:
 
     def start_corner_dragging(self, state: AppState, closest_corner_info: Tuple[int, int, int]) -> bool:
         """Start corner dragging mode"""
+        if state.insert_mode:
+            print('Finish insert mode before dragging a corner.')
+            return False
         corner_x, corner_y, detection_id = closest_corner_info
 
         # Find the detection box
@@ -1259,6 +1359,10 @@ class UserInterface:
         self.skip_empty_images = skip_empty_images
         self.window_name = 'GGSort'
         self.current_original_img = None  # Store current image for relocation
+        # image_id needs to be reachable from the mouse callback (which has no
+        # access to handle_key_press's parameters) for click-to-confirm in
+        # insert mode. display_image_with_boxes keeps this in sync.
+        self._current_image_id: Optional[int] = None
 
     def mouse_callback(self, event, x: int, y: int, flags, param):
         """Handle mouse events"""
@@ -1281,21 +1385,19 @@ class UserInterface:
                 self.state.need_redraw = True
 
         elif event == cv2.EVENT_LBUTTONDOWN:
-            if self.state.relocation_mode:
-                # Handle relocation clicks
-                self.state.relocation_clicks.append((x, y))
-                print(f'Click {len(self.state.relocation_clicks)}: ({x}, {y})')
+            if self.state.insert_mode:
+                # Click acts as an alternative to SPACE for confirming a corner.
+                # The callback runs slightly ahead of the next redraw, so
+                # explicitly sync mouse_x/y from the event coords first.
+                self.state.mouse_x = x
+                self.state.mouse_y = y
+                if self.current_original_img is not None and self._current_image_id is not None:
+                    self.controller.confirm_insert_corner(
+                        self.state, self.current_original_img, self._current_image_id
+                    )
+                return
 
-                if len(self.state.relocation_clicks) == 2:
-                    print('Two clicks recorded. Applying new coordinates...')
-                    if self.current_original_img is not None:
-                        self.controller.apply_relocation(self.state, self.current_original_img)
-                    else:
-                        print('Error: No image available for relocation')
-                        self.state.reset_relocation_mode()
-
-                self.state.need_redraw = True
-            elif not self.state.corner_dragging_mode:
+            if not self.state.corner_dragging_mode:
                 # Try to start corner dragging if mouse is within a corner knob (same as 'd' key)
                 if hasattr(self, '_last_closest_corner_info') and self._last_closest_corner_info is not None:
                     corner_x, corner_y, detection_id = self._last_closest_corner_info
@@ -1328,12 +1430,20 @@ class UserInterface:
         # --- Goto frame (vim-style): digits accumulate, Shift+J jumps. ---
         # Digit keys (0-9) only buffer when we're not in a special mode that
         # would otherwise consume them.
-        if 48 <= key <= 57 and not self.state.corner_dragging_mode and not self.state.relocation_mode:
+        if (
+            48 <= key <= 57
+            and not self.state.corner_dragging_mode
+            and not self.state.insert_mode
+        ):
             self.state.goto_number_buffer += chr(key)
             self.state.need_redraw = True
             return None
 
-        if key == 74 and not self.state.corner_dragging_mode and not self.state.relocation_mode:  # 'J' (Shift+j)
+        if (  # 'J' (Shift+j)
+            key == 74
+            and not self.state.corner_dragging_mode
+            and not self.state.insert_mode
+        ):
             if self.state.goto_number_buffer:
                 # The on-screen counter is 1-indexed, so the buffer is too.
                 target_index = int(self.state.goto_number_buffer) - 1
@@ -1356,15 +1466,19 @@ class UserInterface:
             self.state.goto_number_buffer = ''
             self.state.need_redraw = True
 
-        # Handle escape key specially to cancel corner dragging
+        # Handle escape key specially to cancel corner dragging / insert mode
         if key == 27:  # ESC key
+            if self.state.insert_mode:
+                print('Cancelled insert mode')
+                self.state.reset_insert_mode()
+                self.state.need_redraw = True
+                return None
             if self.state.corner_dragging_mode:
                 print('Cancelled corner dragging - returning to original position')
                 self.state.reset_corner_dragging_mode()
                 self.state.need_redraw = True
                 return None
-            else:
-                return 0  # Exit
+            return 0  # Exit
 
         # Prevent most actions during corner dragging
         if self.state.corner_dragging_mode:
@@ -1375,6 +1489,22 @@ class UserInterface:
             else:
                 print("Corner dragging in progress. Press 'd' or click to finish, or ESC to cancel.")
                 return None
+
+        # Prevent most actions during insert mode. SPACE confirms the current
+        # corner; 'n' toggles the mode off; 'q' still exits. Everything else
+        # is swallowed with a hint so the user can't accidentally page through
+        # images or fire category changes mid-insert.
+        if self.state.insert_mode:
+            if key == 32:  # SPACE → confirm corner
+                self.controller.confirm_insert_corner(self.state, original_img, image_id)
+                return None
+            if key == 113:  # 'q' allow exit
+                return 0
+            if key == 110:  # 'n' toggles insert mode off
+                self.controller.enter_insert_mode(self.state)
+                return None
+            print('Insert mode active. SPACE/click to confirm, ESC to cancel.')
+            return None
 
         if key == 113:  # q
             return 0  # Exit
@@ -1432,8 +1562,13 @@ class UserInterface:
             success = self.controller.clear_all_autodelete_templates()
             if success:
                 self.state.need_redraw = True
-        elif key == 99:  # 'c' key for relocation mode
-            self.controller.handle_relocation_mode(self.state)
+        elif key == 99:  # 'c' key — relocate the selected detection (reuses insert mode)
+            if self.state.selected_detection_id is None:
+                print('No detection selected. Hover over a detection to select it first.')
+            else:
+                self.controller.enter_insert_mode(
+                    self.state, target_detection_id=self.state.selected_detection_id
+                )
         elif key == 100:  # 'd' key for corner dragging mode
             if not self.state.corner_dragging_mode:
                 # Try to start corner dragging if mouse is within a corner knob
@@ -1464,13 +1599,11 @@ class UserInterface:
                     self.state.need_redraw = True
         elif key == 9:  # TAB key for cycling through overlapping detections
             self.controller.cycle_overlapping_detections(self.state)
-        elif key == 78:  # 'N' key (Shift+n) for adding a new detection at the mouse position
-            if original_img is not None and image_id is not None:
-                success = self.controller.add_new_detection_at_mouse(self.state, original_img, image_id)
-                if success:
-                    self.state.need_redraw = True
+        elif key == 110:  # 'n' key — enter interactive two-step insert mode
+            if image_id is not None:
+                self.controller.enter_insert_mode(self.state)
             else:
-                print('Error: No image or image ID available for adding new detection')
+                print('No image loaded — cannot enter insert mode.')
         elif key in CATEGORY_KEYS:  # Category change keys (p, o, etc.)
             if self.controller.handle_category_change(self.state.selected_detection_id, CATEGORY_KEYS[key], image_id):
                 self.state.need_redraw = True
@@ -1481,8 +1614,6 @@ class UserInterface:
             category_info = {'id': 5, 'name': 'Other'}
             if self.controller.handle_category_change(-1, category_info, image_id):
                 self.state.need_redraw = True
-
-        # Note: Relocation completion is now handled in mouse_callback when second click is made
 
         return None
 
@@ -1498,13 +1629,13 @@ class UserInterface:
     ) -> int:
         """Display an image with its bounding boxes"""
         # Reset state when switching images
-        if self.state.relocation_mode:
-            print('Exiting relocation mode due to image change')
-            self.state.reset_relocation_mode()
-
         if self.state.corner_dragging_mode:
             print('Exiting corner dragging mode due to image change')
             self.state.reset_corner_dragging_mode()
+
+        if self.state.insert_mode:
+            print('Exiting insert mode due to image change')
+            self.state.reset_insert_mode()
 
         self.state.reset_overlapping_detections()
 
@@ -1524,8 +1655,11 @@ class UserInterface:
             print(f'Could not read image: {image_path}')
             return 1
 
-        # Store the original image for relocation operations
+        # Store the original image (used by the mouse callback for
+        # click-to-confirm in insert mode).
         self.current_original_img = original_img
+        # Keep the mouse callback's view of image_id in sync too.
+        self._current_image_id = image_id
 
         # Setup window
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)

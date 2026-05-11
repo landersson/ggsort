@@ -46,55 +46,35 @@ class TestUserInterface(unittest.TestCase):
         self.assertTrue(self.state.need_redraw)
     
     def test_mouse_callback_left_click_normal_mode(self):
-        """Test left click in normal mode (should do nothing)"""
-        # Test left click when not in relocation mode (cv2.EVENT_LBUTTONDOWN = 1)
-        self.state.relocation_mode = False
-        
+        """Left click outside any mode tries to start corner dragging; with no
+        knob nearby it should be a quiet no-op."""
+        self.state.insert_mode = False
+        self.state.corner_dragging_mode = False
+        # No closest-corner cache → click does nothing.
+        self.ui._last_closest_corner_info = None
+
         self.ui.mouse_callback(1, 100, 200, 0, None)
-        
-        # Should not add any clicks
-        self.assertEqual(len(self.state.relocation_clicks), 0)
-    
-    def test_mouse_callback_left_click_relocation_mode(self):
-        """Test left click in relocation mode"""
-        # Setup relocation mode
-        self.state.relocation_mode = True
-        self.state.relocation_detection_id = 1
-        self.ui.current_original_img = self.test_image  # Need image for relocation
-        
-        # Configure mock to actually reset state when apply_relocation is called
-        def mock_apply_relocation(state, img):
-            state.reset_relocation_mode()
-            state.need_redraw = True
-            return True
-        
-        self.mock_controller.apply_relocation.side_effect = mock_apply_relocation
-        
-        with patch('builtins.print') as mock_print:
-            # First click
-            self.ui.mouse_callback(1, 100, 200, 0, None)
-            
-            # Verify click was recorded but relocation not completed yet
-            self.assertEqual(len(self.state.relocation_clicks), 1)
-            self.assertEqual(self.state.relocation_clicks[0], (100, 200))
-            self.assertTrue(self.state.need_redraw)
-            self.assertTrue(self.state.relocation_mode)  # Still in relocation mode
-            mock_print.assert_called_with("Click 1: (100, 200)")
-            
-            # Second click - should complete relocation immediately
-            self.ui.mouse_callback(1, 400, 600, 0, None)
-            
-            # Verify relocation was completed and state reset
-            self.assertEqual(len(self.state.relocation_clicks), 0)  # Reset after completion
-            self.assertFalse(self.state.relocation_mode)  # Exited relocation mode
-            
-            # Check print calls
-            expected_calls = [
-                call("Click 1: (100, 200)"),
-                call("Click 2: (400, 600)"),
-                call("Two clicks recorded. Applying new coordinates...")
-            ]
-            mock_print.assert_has_calls(expected_calls)
+
+        self.mock_controller.confirm_insert_corner.assert_not_called()
+        self.mock_controller.start_corner_dragging.assert_not_called()
+
+    def test_mouse_callback_left_click_insert_mode_confirms(self):
+        """In insert mode, clicks confirm a corner via the controller (same
+        path as SPACE). Covers both the new-detection and relocation flows
+        since the click handler doesn't distinguish."""
+        self.state.insert_mode = True
+        self.state.insert_stage = 'awaiting_top_left'
+        self.ui.current_original_img = self.test_image
+        self.ui._current_image_id = 5
+
+        self.ui.mouse_callback(1, 100, 200, 0, None)
+
+        # Mouse position was synced from the event coords before confirm.
+        self.assertEqual(self.state.mouse_x, 100)
+        self.assertEqual(self.state.mouse_y, 200)
+        self.mock_controller.confirm_insert_corner.assert_called_once_with(
+            self.state, self.test_image, 5
+        )
     
     def test_handle_key_press_exit_keys(self):
         """Test exit key handling"""
@@ -170,12 +150,21 @@ class TestUserInterface(unittest.TestCase):
         mock_print.assert_called_with("Failed to toggle deleted status for detection 1")
     
     def test_handle_key_press_relocation_mode(self):
-        """Test relocation mode key ('c')"""
-        # Test entering relocation mode
-        result = self.ui.handle_key_press(99, self.test_image)  # 'c' key
-        
+        """'c' key now enters the relocation flavor of insert mode (target = selected)."""
+        # No selection → no insert mode entry.
+        self.state.selected_detection_id = None
+        with patch('builtins.print'):
+            result = self.ui.handle_key_press(99, self.test_image)
         self.assertIsNone(result)
-        self.mock_controller.handle_relocation_mode.assert_called_once_with(self.state)
+        self.mock_controller.enter_insert_mode.assert_not_called()
+
+        # With a selection → enter_insert_mode is called with target_detection_id.
+        self.state.selected_detection_id = 3
+        result = self.ui.handle_key_press(99, self.test_image)
+        self.assertIsNone(result)
+        self.mock_controller.enter_insert_mode.assert_called_once_with(
+            self.state, target_detection_id=3
+        )
     
     def test_handle_key_press_cycle_overlapping(self):
         """Test cycling through overlapping detections (TAB)"""
@@ -219,29 +208,27 @@ class TestUserInterface(unittest.TestCase):
         self.assertIsNone(result)
         self.assertFalse(self.state.need_redraw)  # Should not redraw on failure
     
-    def test_handle_key_press_relocation_completion(self):
-        """Test that relocation completion no longer happens in key press handling"""
-        # Setup relocation mode with two clicks
-        self.state.relocation_mode = True
-        self.state.relocation_clicks = [(100, 200), (400, 600)]
-        
-        # With the new design, relocation completion happens in mouse_callback
-        # when the second click is made, not in handle_key_press
-        # So any key press should not trigger relocation completion
-        result = self.ui.handle_key_press(65, self.test_image)  # 'A' key (unknown key)
-        
-        # Should NOT call apply_relocation since completion happens in mouse callback now
-        self.mock_controller.apply_relocation.assert_not_called()
-        self.assertIsNone(result)  # Unknown key should not navigate
-    
-    def test_handle_key_press_unknown_key(self):
-        """Test handling of unknown keys"""
-        # Test a key that's not mapped to any function
-        result = self.ui.handle_key_press(65, self.test_image)  # 'A' key
-        
+    def test_handle_key_press_relocation_completion_while_in_insert_mode(self):
+        """In insert mode, SPACE confirms the current corner via the controller
+        (this is also how the 'c' relocation flow finalises)."""
+        self.state.insert_mode = True
+        self.state.insert_stage = 'awaiting_bottom_right'
+        self.state.insert_top_left = (100, 200)
+        self.state.insert_target_detection_id = 1
+
+        result = self.ui.handle_key_press(32, self.test_image, image_id=7)  # SPACE
+
         self.assertIsNone(result)
-        # Should not call any controller methods
-        self.mock_controller.handle_relocation_mode.assert_not_called()
+        self.mock_controller.confirm_insert_corner.assert_called_once_with(
+            self.state, self.test_image, 7
+        )
+
+    def test_handle_key_press_unknown_key(self):
+        """Unknown keys do nothing."""
+        result = self.ui.handle_key_press(65, self.test_image)  # 'A' key
+
+        self.assertIsNone(result)
+        self.mock_controller.enter_insert_mode.assert_not_called()
         self.mock_controller.cycle_overlapping_detections.assert_not_called()
         self.mock_controller.handle_category_change.assert_not_called()
     
@@ -378,10 +365,10 @@ class TestUserInterface(unittest.TestCase):
         mock_getTextSize.return_value = ((100, 20), 5)
         mock_waitKey.return_value = 27  # ESC to exit immediately
         
-        # Setup state with relocation mode and overlapping detections
-        self.state.relocation_mode = True
-        self.state.relocation_detection_id = 1
-        self.state.relocation_clicks = [(100, 200)]
+        # Setup state with insert mode (relocation flavor) and overlapping detections.
+        self.state.insert_mode = True
+        self.state.insert_stage = 'awaiting_top_left'
+        self.state.insert_target_detection_id = 1
         self.state.overlapping_detections = [MagicMock()]
         self.state.current_overlap_index = 1
         
@@ -399,17 +386,17 @@ class TestUserInterface(unittest.TestCase):
                 {'1': 'GangGang'}, 0, 1
             )
         
-        # Verify relocation mode was reset
-        self.assertFalse(self.state.relocation_mode)
-        self.assertIsNone(self.state.relocation_detection_id)
-        self.assertEqual(len(self.state.relocation_clicks), 0)
-        
+        # Verify insert mode was reset
+        self.assertFalse(self.state.insert_mode)
+        self.assertIsNone(self.state.insert_target_detection_id)
+        self.assertIsNone(self.state.insert_stage)
+
         # Verify overlapping detections were reset
         self.assertEqual(len(self.state.overlapping_detections), 0)
         self.assertEqual(self.state.current_overlap_index, 0)
-        
-        # Verify print message about exiting relocation mode
-        mock_print.assert_any_call("Exiting relocation mode due to image change")
+
+        # Verify print message about exiting insert mode
+        mock_print.assert_any_call("Exiting insert mode due to image change")
     
     @patch('cv2.imread')
     @patch('cv2.namedWindow')
@@ -456,51 +443,48 @@ class TestUserInterface(unittest.TestCase):
         self.assertEqual(self.ui.window_name, "GGSort")
     
     def test_state_need_redraw_management(self):
-        """Test that need_redraw flag is properly managed"""
+        """Mouse movement and insert-mode clicks both trigger redraws."""
         # Initially should not need redraw
         self.assertFalse(self.state.need_redraw)
-        
+
         # Mouse movement should trigger redraw
         self.ui.mouse_callback(0, 100, 200, 0, None)
         self.assertTrue(self.state.need_redraw)
-        
+
         # Reset for next test
         self.state.need_redraw = False
-        
-        # Left click in relocation mode should trigger redraw
-        self.state.relocation_mode = True
+
+        # A confirm-in-insert-mode click goes through confirm_insert_corner,
+        # which sets need_redraw on the real controller. Here we just verify
+        # it's dispatched (the controller is mocked).
+        self.state.insert_mode = True
+        self.state.insert_stage = 'awaiting_top_left'
+        self.ui.current_original_img = self.test_image
+        self.ui._current_image_id = 1
         self.ui.mouse_callback(1, 100, 200, 0, None)
-        self.assertTrue(self.state.need_redraw)
+        self.mock_controller.confirm_insert_corner.assert_called_once_with(
+            self.state, self.test_image, 1
+        )
 
     def test_mouse_callback_relocation_completion(self):
-        """Test that relocation completes immediately when second click is made"""
-        # Setup relocation mode
-        self.state.relocation_mode = True
-        self.state.relocation_detection_id = 1
+        """Two clicks during the relocation flavor of insert mode call
+        confirm_insert_corner twice; finalisation lives inside the controller."""
+        self.state.insert_mode = True
+        self.state.insert_stage = 'awaiting_top_left'
+        self.state.insert_target_detection_id = 1
         self.ui.current_original_img = self.test_image
-        
-        with patch('builtins.print') as mock_print:
-            # First click
-            self.ui.mouse_callback(1, 100, 200, 0, None)
-            
-            # Verify first click was recorded but relocation not completed
-            self.assertEqual(len(self.state.relocation_clicks), 1)
-            self.assertTrue(self.state.relocation_mode)
-            self.mock_controller.apply_relocation.assert_not_called()
-            
-            # Second click - should complete relocation immediately
-            self.ui.mouse_callback(1, 400, 600, 0, None)
-            
-            # Verify relocation was applied
-            self.mock_controller.apply_relocation.assert_called_once_with(self.state, self.test_image)
-            
-            # Check print messages
-            expected_calls = [
-                call("Click 1: (100, 200)"),
-                call("Click 2: (400, 600)"),
-                call("Two clicks recorded. Applying new coordinates...")
-            ]
-            mock_print.assert_has_calls(expected_calls)
+        self.ui._current_image_id = 7
+
+        # First click — top-left.
+        self.ui.mouse_callback(1, 100, 200, 0, None)
+        # Second click — bottom-right.
+        self.ui.mouse_callback(1, 400, 600, 0, None)
+
+        # Two dispatches to the controller.
+        self.assertEqual(self.mock_controller.confirm_insert_corner.call_count, 2)
+        self.mock_controller.confirm_insert_corner.assert_any_call(
+            self.state, self.test_image, 7
+        )
 
 
 class TestUserInterfaceKeyMappings(unittest.TestCase):

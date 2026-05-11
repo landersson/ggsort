@@ -197,27 +197,34 @@ class TestDetectionRenderer(unittest.TestCase):
     @patch('cv2.putText')
     @patch('cv2.getTextSize')
     def test_draw_boxes_with_relocation_mode(self, mock_getTextSize, mock_putText, mock_rectangle):
-        """Test drawing boxes in relocation mode"""
+        """Relocation now flows through insert mode: the targeted box draws
+        black, and once the top-left is locked a white preview rectangle
+        (sized like a normal detection box, with a black outline and a yellow
+        corner dot) appears."""
         mock_getTextSize.return_value = ((100, 20), 5)
-        
-        # Setup relocation mode
-        self.state.relocation_mode = True
-        self.state.relocation_detection_id = 1
-        self.state.relocation_clicks = [(100, 200), (400, 600)]
-        
+
+        # Mid-relocation: top-left already locked, awaiting bottom-right.
+        self.state.insert_mode = True
+        self.state.insert_stage = 'awaiting_bottom_right'
+        self.state.insert_target_detection_id = 1
+        self.state.insert_top_left = (100, 200)
+        self.state.mouse_x, self.state.mouse_y = 400, 600
+
         original_img = np.zeros((1080, 1920, 3), dtype=np.uint8)
         detections = [self.test_detection1]
-        
-        # Mock cv2.circle for relocation UI
+
         with patch('cv2.circle') as mock_circle:
-            result_img = self.renderer.draw_boxes_on_image(original_img, detections, self.state)
-        
-        # Verify relocation UI was drawn (circles for clicks)
-        self.assertEqual(mock_circle.call_count, 2)  # Two clicks = two circles
-        
-        # Verify additional rectangle for new bounding box preview
-        # Should have: outline + colored rectangle for detection + preview rectangle
-        self.assertGreaterEqual(mock_rectangle.call_count, 3)
+            self.renderer.draw_boxes_on_image(original_img, detections, self.state)
+
+        # Two circles: black halo + yellow dot marking the locked top-left.
+        self.assertEqual(mock_circle.call_count, 2)
+
+        # Rectangle calls include: outline + colored (black) detection box +
+        # preview black outline + preview white fill stroke = at least 4.
+        self.assertGreaterEqual(mock_rectangle.call_count, 4)
+        # One rectangle call should be solid white (preview fill stroke).
+        white_calls = [c for c in mock_rectangle.call_args_list if c[0][3] == (255, 255, 255)]
+        self.assertEqual(len(white_calls), 1)
     
     @patch('cv2.rectangle')
     @patch('cv2.putText')
@@ -306,25 +313,27 @@ class TestDetectionRenderer(unittest.TestCase):
             self.assertEqual(self.state.current_overlap_index, 0)
     
     def test_relocation_mode_state_isolation(self):
-        """Test that relocation mode doesn't interfere with normal detection selection"""
+        """Insert mode (including its relocation flavor) must not let mouse
+        movement reshuffle the selected detection — that would change what's
+        being relocated mid-flow."""
         original_img = np.zeros((1080, 1920, 3), dtype=np.uint8)
         detections = [self.test_detection1, self.test_detection2]
-        
-        # First, establish normal selection
+
+        # First, establish normal selection.
         self.state.update_mouse_position(300, 300)
         self.renderer.draw_boxes_on_image(original_img, detections, self.state)
         normal_selection = self.state.selected_detection_id
-        
-        # Enter relocation mode
-        self.state.relocation_mode = True
-        self.state.relocation_detection_id = 1
-        
-        # Move mouse to different position
+
+        # Enter the relocation flavor of insert mode.
+        self.state.insert_mode = True
+        self.state.insert_stage = 'awaiting_top_left'
+        self.state.insert_target_detection_id = 1
+
+        # Move mouse to a different position.
         self.state.update_mouse_position(800, 200)
         self.renderer.draw_boxes_on_image(original_img, detections, self.state)
-        
-        # In relocation mode, overlapping detection logic should be skipped
-        # So selection should remain the same as before entering relocation mode
+
+        # Selection should remain frozen at the pre-mode value.
         self.assertEqual(self.state.selected_detection_id, normal_selection)
     
     def test_coordinate_boundary_handling(self):
